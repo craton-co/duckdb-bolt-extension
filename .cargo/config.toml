@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Statically link the MSVC C runtime so bolt.duckdb_extension does not depend on the VC++ redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Ctarget-feature=+crt-static"]

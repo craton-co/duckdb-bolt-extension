@@ -1,0 +1,76 @@
+# Reusable workflow that resolves the commit a submodule is pinned at (its gitlink) in the
+# *calling* repository.
+#
+# Extensions vendor DuckDB as a submodule but pass `duckdb_version` to the build workflows as a
+# literal, so the two have to be kept in sync by hand. This resolves the pin instead, making the
+# submodule the single source of truth: bumping the submodule is then the only action needed to
+# move CI.
+#
+# Usage:
+#   jobs:
+#     duckdb-submodule-version:
+#       uses: duckdb/extension-ci-tools/.github/workflows/_submodule_version.yml@main
+#
+#     duckdb-stable-build:
+#       needs: duckdb-submodule-version
+#       uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+#       with:
+#         duckdb_version: ${{ needs.duckdb-submodule-version.outputs.version }}
+#         ci_tools_version: main
+#         extension_name: <name>
+
+name: Submodule version
+
+on:
+  workflow_call:
+    inputs:
+      # Path of the submodule to resolve, relative to the root of the calling repository.
+      submodule_path:
+        required: false
+        type: string
+        default: duckdb
+    outputs:
+      version:
+        description: Commit SHA the submodule is pinned at in the calling repository.
+        value: ${{ jobs.resolve.outputs.version }}
+
+jobs:
+  resolve:
+    name: Resolve submodule pin
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      # Reusable workflows run in the caller's context, so this checks out the calling repository
+      # at the calling commit. Only the git object database is needed: the gitlink lives in the
+      # commit tree, so the submodule itself is never cloned and `submodules:` is left off
+      # deliberately. On pull_request this resolves the pin of the merge commit, which is the
+      # DuckDB the build would actually use.
+      - name: Checkout / Calling repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          sparse-checkout: .github
+
+      - name: Resolve / Submodule pin
+        id: version
+        env:
+          SUBMODULE_PATH: ${{ inputs.submodule_path }}
+        run: |
+          set -euo pipefail
+
+          entry=$(git ls-tree HEAD "$SUBMODULE_PATH")
+          if [[ -z "$entry" ]]; then
+            echo "::error::No entry at '$SUBMODULE_PATH' in $(git rev-parse HEAD)."
+            exit 1
+          fi
+
+          # Mode 160000 marks a gitlink. Without this check a plain file or directory would
+          # silently yield a blob or tree hash and be passed on as a DuckDB ref.
+          read -r mode _type sha _path <<< "$entry"
+          if [[ "$mode" != "160000" ]]; then
+            echo "::error::'$SUBMODULE_PATH' is not a submodule (mode $mode, expected 160000)."
+            exit 1
+          fi
+
+          echo "Resolved submodule '$SUBMODULE_PATH' to $sha"
+          echo "version=$sha" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# deny.toml — cargo-deny configuration for duckdb-bolt-extension (mirrors craton-bolt's policy).
+#
+# Run locally:
+#     cargo install --locked cargo-deny
+#     cargo deny --all-features check
+#
+# CI runs the same command in .github/workflows/RustCI.yml (`deny` job).
+# Schema reference: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Scan the complete graph: the `cuda-stub` feature, duckdb-neo's `build-extension` (native / wasm
+# crates) and `build-extension-static` (core dev-dependency), and the build-time downloader that
+# fetches DuckDB. Feature resolution is metadata-only here, so the mutually exclusive duckdb-neo
+# features do not matter.
+all-features = true
+no-default-features = false
+
+[licenses]
+version = 2
+# Permissive licenses compatible with distributing binaries under Apache-2.0 (with NOTICE).
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "BSL-1.0",
+    # Mozilla's CA bundle via `webpki-roots` (build-time DuckDB download only).
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+# Workspace crates that are never published (duckdb-bolt-extension, duckdb-bolt-wasm).
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies inside this workspace are fine.
+allow-wildcard-paths = true
+highlight = "all"
+deny = []
+skip = []
+skip-tree = []
+
+[advisories]
+version = 2
+# Vulnerability and unsound advisories are always denied by cargo-deny v2.
+unmaintained = "all"
+yanked = "warn"
+ignore = [
+    # POLICY: list an advisory here only with (a) its exact id, (b) which feature graph reaches
+    # it, (c) why no upgrade is available, and (d) an entry in SECURITY.md. Re-check on every bump.
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

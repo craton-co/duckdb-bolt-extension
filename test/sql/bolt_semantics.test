@@ -1,0 +1,404 @@
+# name: test/sql/bolt_semantics.test
+# description: Catalog naming, COPY options and modes, option validation, replacement-scan shadowing, and float pushdown semantics
+# group: [bolt]
+#
+# Every expectation here was checked against the code on both backends (cuda-gpu and
+# host-planner-fallback). The Bolt catalog is process-wide: this file uses its own `sem_*` table
+# names and clears the catalog at start and end. No `bolt_*` option is changed.
+
+require bolt
+
+statement ok
+PRAGMA bolt_clear_tables;
+
+# --- Table names: case-insensitive lookup and the bolt. / bolt: / bolt.main. prefixes ---
+
+statement ok
+COPY (SELECT 1::INTEGER AS v) TO 'sem_t' (FORMAT bolt, USE_TMP_FILE FALSE);
+
+query IIT
+SELECT num_rows, num_columns, schema FROM bolt_tables() WHERE table_name = 'sem_t';
+----
+1	1	v: INTEGER
+
+query IIII
+SELECT
+    (SELECT count(*) FROM bolt_scan('SEM_T')),
+    (SELECT count(*) FROM bolt_scan('bolt.sem_t')),
+    (SELECT count(*) FROM bolt_scan('BOLT:Sem_T')),
+    (SELECT count(*) FROM bolt.main.sem_t);
+----
+1	1	1	1
+
+# Bare name: no DuckDB object called sem_t exists, so the replacement scan resolves it.
+query I
+SELECT count(*) FROM sem_t;
+----
+1
+
+statement error
+SELECT * FROM bolt_scan('sem_no_such_table');
+----
+is not registered
+
+# --- COPY ... TO modes ---
+
+statement error
+COPY (SELECT 2::INTEGER AS v) TO 'sem_t' (FORMAT bolt, MODE 'create', USE_TMP_FILE FALSE);
+----
+already registered
+
+# 'error' is an alias of 'create'; the existing name matches case-insensitively.
+statement error
+COPY (SELECT 2::INTEGER AS v) TO 'SEM_T' (FORMAT bolt, MODE 'error', USE_TMP_FILE FALSE);
+----
+already registered
+
+statement error
+COPY (SELECT 2::INTEGER AS v) TO 'sem_t' (FORMAT bolt, MODE 'bogus', USE_TMP_FILE FALSE);
+----
+Invalid Bolt registration mode 'bogus'
+
+# Mode names are case-insensitive; append keeps the existing rows.
+statement ok
+COPY (SELECT 2::INTEGER AS v) TO 'sem_t' (FORMAT bolt, MODE 'APPEND', USE_TMP_FILE FALSE);
+
+query II
+SELECT count(*), sum(v) FROM bolt_scan('sem_t');
+----
+2	3
+
+# Appending a different number of columns is an error and appends nothing.
+statement error
+COPY (SELECT 3::INTEGER AS v, 4::INTEGER AS w) TO 'sem_t' (FORMAT bolt, MODE 'append', USE_TMP_FILE FALSE);
+----
+Schema mismatch
+
+query I
+SELECT num_rows FROM bolt_tables() WHERE table_name = 'sem_t';
+----
+2
+
+# 'overwrite' is an alias of 'replace' (the default): the table is replaced, with a new schema.
+statement ok
+COPY (SELECT 'x' AS s, 10::BIGINT AS n) TO 'sem_t' (FORMAT bolt, MODE 'overwrite', USE_TMP_FILE FALSE);
+
+query IIT
+SELECT num_rows, num_columns, schema FROM bolt_tables() WHERE table_name = 'sem_t';
+----
+1	2	s: VARCHAR, n: BIGINT
+
+# Append to a table that does not exist yet creates it.
+statement ok
+COPY (SELECT 5::INTEGER AS v) TO 'sem_new' (FORMAT bolt, MODE 'append', USE_TMP_FILE FALSE);
+
+query I
+SELECT num_rows FROM bolt_tables() WHERE table_name = 'sem_new';
+----
+1
+
+# --- COPY ... TO options ---
+
+statement error
+COPY (SELECT 1 AS v) TO 'sem_opt' (FORMAT bolt, BOGUS_OPTION 1, USE_TMP_FILE FALSE);
+----
+Unknown COPY TO (FORMAT bolt) option 'bogus_option'
+
+statement error
+COPY (SELECT 1 AS v) TO 'sem_opt' (FORMAT bolt, TABLE 'sem_a', TABLE_NAME 'sem_b', USE_TMP_FILE FALSE);
+----
+mutually exclusive
+
+# The TABLE option overrides the target path.
+statement ok
+COPY (SELECT 7::INTEGER AS v) TO 'ignored_path.bolt' (FORMAT bolt, TABLE 'sem_named', USE_TMP_FILE FALSE);
+
+query I
+SELECT v FROM bolt_scan('sem_named');
+----
+7
+
+query I
+SELECT count(*) FROM bolt_tables() WHERE table_name IN ('sem_opt', 'sem_a', 'sem_b', 'ignored_path.bolt', 'ignored_path');
+----
+0
+
+# The engine-only scratch table name is reserved (case-insensitively).
+statement error
+COPY (SELECT 1 AS v) TO '__BOLT_SCRATCH' (FORMAT bolt, USE_TMP_FILE FALSE);
+----
+is reserved
+
+# --- Empty tables ---
+
+statement ok
+COPY (SELECT 1::INTEGER AS v WHERE false) TO 'sem_empty' (FORMAT bolt, USE_TMP_FILE FALSE);
+
+query II
+SELECT num_rows, num_columns FROM bolt_tables() WHERE table_name = 'sem_empty';
+----
+0	1
+
+query I
+SELECT count(*) FROM bolt_scan('sem_empty');
+----
+0
+
+query I
+SELECT count(*) FROM bolt_scan('sem_empty') WHERE v > 0;
+----
+0
+
+statement ok
+CREATE TABLE sem_empty_dest (v INTEGER);
+
+statement ok
+COPY sem_empty_dest FROM 'sem_empty' (FORMAT bolt);
+
+query I
+SELECT count(*) FROM sem_empty_dest;
+----
+0
+
+# --- COPY ... FROM argument checks ---
+
+statement ok
+CREATE TABLE sem_dest (v INTEGER);
+
+statement error
+COPY sem_dest FROM 'sem_t' (FORMAT bolt);
+----
+Column count mismatch
+
+statement error
+COPY sem_dest FROM 'sem_new' (FORMAT bolt, MODE 'append');
+----
+does not take a MODE option
+
+statement error
+COPY sem_dest FROM 'sem_no_such_table' (FORMAT bolt);
+----
+is not registered
+
+statement ok
+COPY sem_dest FROM 'SEM_NEW' (FORMAT bolt);
+
+query I
+SELECT v FROM sem_dest;
+----
+5
+
+# --- Replacement-scan shadowing: DuckDB objects always win over the bare-name form ---
+
+statement ok
+CREATE TABLE sem_shadow AS SELECT range::INTEGER AS v FROM range(5);
+
+statement ok
+COPY (SELECT 1::INTEGER AS v) TO 'sem_shadow' (FORMAT bolt, USE_TMP_FILE FALSE);
+
+query II
+SELECT (SELECT count(*) FROM sem_shadow), (SELECT count(*) FROM bolt.sem_shadow);
+----
+5	1
+
+query I
+WITH sem_new AS (SELECT 1 AS v UNION ALL SELECT 2) SELECT count(*) FROM sem_new;
+----
+2
+
+# --- bolt_drop_table ---
+
+query II
+SELECT bolt_drop_table('SEM_NEW'), bolt_drop_table(NULL);
+----
+true	NULL
+
+query I
+SELECT bolt_drop_table('sem_new');
+----
+false
+
+statement error
+SELECT * FROM bolt_scan('sem_new');
+----
+is not registered
+
+# --- bolt_query argument checks ---
+
+statement error
+SELECT * FROM bolt_query('');
+----
+cannot be empty
+
+statement error
+SELECT * FROM bolt_query('   ');
+----
+cannot be empty
+
+# --- Option validation (values are rejected before the runtime is touched) ---
+
+statement error
+SET bolt_device = -1;
+----
+non-negative
+
+statement error
+SET bolt_memory_budget = -1;
+----
+must be >= 0
+
+statement error
+SET bolt_ptx_cache_dir = 'relative/ptx_dir';
+----
+absolute path
+
+statement error
+SET bolt_device = NULL;
+----
+
+statement error
+SET SESSION bolt_device = 0;
+----
+
+query III
+SELECT current_setting('bolt_device'), current_setting('bolt_memory_budget'), current_setting('bolt_ptx_cache_dir');
+----
+0	0	(empty)
+
+# --- Projection: duplicate and reordered columns, count(*) with a VARCHAR first column ---
+
+statement ok
+CREATE TABLE sem_s_local AS SELECT 'name_' || i::VARCHAR AS s, i::INTEGER AS id FROM range(0, 100) t(i);
+
+statement ok
+COPY sem_s_local TO 'sem_s' (FORMAT bolt, USE_TMP_FILE FALSE);
+
+query II
+SELECT id, id FROM bolt_scan('sem_s') WHERE id = 3;
+----
+3	3
+
+query TI
+SELECT s, id FROM bolt_scan('sem_s') WHERE id = 42;
+----
+name_42	42
+
+query I
+SELECT count(*) FROM bolt_scan('sem_s') WHERE id > 10;
+----
+89
+
+query I
+SELECT count(*) FROM bolt_scan('sem_s');
+----
+100
+
+# --- FLOAT / DOUBLE pushdown semantics (NaN, infinities, NULL, exact FLOAT literals) ---
+# Differential: the symmetric difference with plain DuckDB must be empty. On cuda-gpu these
+# predicates are pushed into Craton Bolt; on host-planner-fallback DuckDB evaluates them.
+
+statement ok
+CREATE TABLE sem_f_local AS
+SELECT
+    i::INTEGER AS id,
+    CASE WHEN i % 5 = 0 THEN 'NaN'::DOUBLE
+         WHEN i % 7 = 0 THEN NULL
+         WHEN i = 11 THEN 'inf'::DOUBLE
+         WHEN i = 13 THEN '-inf'::DOUBLE
+         WHEN i = 17 THEN -0.0::DOUBLE
+         ELSE (i % 10) * 0.7 END::DOUBLE AS d,
+    CASE WHEN i % 6 = 0 THEN 'NaN'::FLOAT
+         WHEN i % 4 = 0 THEN NULL
+         ELSE ((i % 10) * 0.1)::FLOAT END AS f
+FROM range(0, 300) t(i);
+
+statement ok
+COPY sem_f_local TO 'sem_f' (FORMAT bolt, USE_TMP_FILE FALSE);
+
+query I
+SELECT count(*) FROM ((SELECT id FROM sem_f_local WHERE d > 3 EXCEPT ALL SELECT id FROM bolt_scan('sem_f') WHERE d > 3) UNION ALL (SELECT id FROM bolt_scan('sem_f') WHERE d > 3 EXCEPT ALL SELECT id FROM sem_f_local WHERE d > 3));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM sem_f_local WHERE d >= 2.1 EXCEPT ALL SELECT id FROM bolt_scan('sem_f') WHERE d >= 2.1) UNION ALL (SELECT id FROM bolt_scan('sem_f') WHERE d >= 2.1 EXCEPT ALL SELECT id FROM sem_f_local WHERE d >= 2.1));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM sem_f_local WHERE d != 1.4 EXCEPT ALL SELECT id FROM bolt_scan('sem_f') WHERE d != 1.4) UNION ALL (SELECT id FROM bolt_scan('sem_f') WHERE d != 1.4 EXCEPT ALL SELECT id FROM sem_f_local WHERE d != 1.4));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM sem_f_local WHERE d < 3 EXCEPT ALL SELECT id FROM bolt_scan('sem_f') WHERE d < 3) UNION ALL (SELECT id FROM bolt_scan('sem_f') WHERE d < 3 EXCEPT ALL SELECT id FROM sem_f_local WHERE d < 3));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM sem_f_local WHERE d <= 0 EXCEPT ALL SELECT id FROM bolt_scan('sem_f') WHERE d <= 0) UNION ALL (SELECT id FROM bolt_scan('sem_f') WHERE d <= 0 EXCEPT ALL SELECT id FROM sem_f_local WHERE d <= 0));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM sem_f_local WHERE 3 < d EXCEPT ALL SELECT id FROM bolt_scan('sem_f') WHERE 3 < d) UNION ALL (SELECT id FROM bolt_scan('sem_f') WHERE 3 < d EXCEPT ALL SELECT id FROM sem_f_local WHERE 3 < d));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM sem_f_local WHERE NOT (d > 3) EXCEPT ALL SELECT id FROM bolt_scan('sem_f') WHERE NOT (d > 3)) UNION ALL (SELECT id FROM bolt_scan('sem_f') WHERE NOT (d > 3) EXCEPT ALL SELECT id FROM sem_f_local WHERE NOT (d > 3)));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM sem_f_local WHERE d IN (0.7, 1.4) EXCEPT ALL SELECT id FROM bolt_scan('sem_f') WHERE d IN (0.7, 1.4)) UNION ALL (SELECT id FROM bolt_scan('sem_f') WHERE d IN (0.7, 1.4) EXCEPT ALL SELECT id FROM sem_f_local WHERE d IN (0.7, 1.4)));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM sem_f_local WHERE d NOT IN (0.7, 1.4) EXCEPT ALL SELECT id FROM bolt_scan('sem_f') WHERE d NOT IN (0.7, 1.4)) UNION ALL (SELECT id FROM bolt_scan('sem_f') WHERE d NOT IN (0.7, 1.4) EXCEPT ALL SELECT id FROM sem_f_local WHERE d NOT IN (0.7, 1.4)));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM sem_f_local WHERE d = 0 EXCEPT ALL SELECT id FROM bolt_scan('sem_f') WHERE d = 0) UNION ALL (SELECT id FROM bolt_scan('sem_f') WHERE d = 0 EXCEPT ALL SELECT id FROM sem_f_local WHERE d = 0));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM sem_f_local WHERE d IS NULL OR d > 6 EXCEPT ALL SELECT id FROM bolt_scan('sem_f') WHERE d IS NULL OR d > 6) UNION ALL (SELECT id FROM bolt_scan('sem_f') WHERE d IS NULL OR d > 6 EXCEPT ALL SELECT id FROM sem_f_local WHERE d IS NULL OR d > 6));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM sem_f_local WHERE f = 0.1::FLOAT EXCEPT ALL SELECT id FROM bolt_scan('sem_f') WHERE f = 0.1::FLOAT) UNION ALL (SELECT id FROM bolt_scan('sem_f') WHERE f = 0.1::FLOAT EXCEPT ALL SELECT id FROM sem_f_local WHERE f = 0.1::FLOAT));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM sem_f_local WHERE f > 0.3::FLOAT EXCEPT ALL SELECT id FROM bolt_scan('sem_f') WHERE f > 0.3::FLOAT) UNION ALL (SELECT id FROM bolt_scan('sem_f') WHERE f > 0.3::FLOAT EXCEPT ALL SELECT id FROM sem_f_local WHERE f > 0.3::FLOAT));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM sem_f_local WHERE f <= 0.7::FLOAT EXCEPT ALL SELECT id FROM bolt_scan('sem_f') WHERE f <= 0.7::FLOAT) UNION ALL (SELECT id FROM bolt_scan('sem_f') WHERE f <= 0.7::FLOAT EXCEPT ALL SELECT id FROM sem_f_local WHERE f <= 0.7::FLOAT));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM sem_f_local WHERE f != 0.5::FLOAT EXCEPT ALL SELECT id FROM bolt_scan('sem_f') WHERE f != 0.5::FLOAT) UNION ALL (SELECT id FROM bolt_scan('sem_f') WHERE f != 0.5::FLOAT EXCEPT ALL SELECT id FROM sem_f_local WHERE f != 0.5::FLOAT));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM sem_f_local WHERE f IN (0.1::FLOAT, 0.2::FLOAT) EXCEPT ALL SELECT id FROM bolt_scan('sem_f') WHERE f IN (0.1::FLOAT, 0.2::FLOAT)) UNION ALL (SELECT id FROM bolt_scan('sem_f') WHERE f IN (0.1::FLOAT, 0.2::FLOAT) EXCEPT ALL SELECT id FROM sem_f_local WHERE f IN (0.1::FLOAT, 0.2::FLOAT)));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM sem_f_local WHERE f = 0.3 EXCEPT ALL SELECT id FROM bolt_scan('sem_f') WHERE f = 0.3) UNION ALL (SELECT id FROM bolt_scan('sem_f') WHERE f = 0.3 EXCEPT ALL SELECT id FROM sem_f_local WHERE f = 0.3));
+----
+0
+
+statement ok
+PRAGMA bolt_clear_tables;
