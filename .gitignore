@@ -1,0 +1,12 @@
+/target
+build
+configure
+.idea
+duckdb_unittest_tempdir
+/test/bin
+venv
+/docs/internal/
+*.duckdb_extension
+*.profraw
+lcov.info
+__pycache__/

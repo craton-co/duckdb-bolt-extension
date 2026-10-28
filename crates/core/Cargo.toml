@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "duckdb-bolt-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+# The SQLLogicTest runner reads ../../test/sql, which is not part of the packaged crate.
+exclude = ["tests/sqllogictest_and_loadable.rs"]
+
+[lib]
+name = "duckdb_bolt_core"
+
+# docs.rs has no CUDA toolkit; build docs against the CPU stub.
+[package.metadata.docs.rs]
+features = ["cuda-stub"]
+
+[features]
+default = []
+cuda-stub = ["craton-bolt/cuda-stub"]
+
+[dependencies]
+duckdb-neo.workspace = true
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-cast.workspace = true
+arrow-schema.workspace = true
+arrow-select.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+craton-bolt.workspace = true
+arrow-ipc.workspace = true
+parquet.workspace = true
+# `parquet::file::reader::ChunkReader::get_bytes` returns `bytes::Bytes`, which `parquet` does not
+# re-export: needed for ranged Parquet reads through DuckDB's file system (W2-D-002 item 2).
+# Already in Cargo.lock through `parquet` (MIT).
+bytes = "1"
+# Restores the process-global `log` level that craton-bolt's `enable_tracing` raises (W2-E-009).
+log = "0.4"
+
+[dev-dependencies]
+duckdb-loadable-macros.workspace = true
+duckdb-neo = { workspace = true, default-features = true, features = ["build-extension-static"] }
+

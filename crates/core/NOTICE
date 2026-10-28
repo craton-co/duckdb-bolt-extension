@@ -1,0 +1,42 @@
+Craton Bolt DuckDB Extension (duckdb-bolt-extension)
+Copyright 2026 Craton Software Company (https://craton.com.ar)
+
+This product includes software developed at
+Craton Software Company (https://craton.com.ar).
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this software except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+-------------------------------------------------------------------------------
+Third-Party Dependencies and Attributions
+-------------------------------------------------------------------------------
+
+This software links against or incorporates components from the following
+open-source projects:
+
+* Craton Bolt (craton-bolt)
+  Copyright 2025-2026 Craton Software Company (https://craton.com.ar)
+  Licensed under the Apache License, Version 2.0.
+
+* Apache Arrow (arrow, arrow-array, arrow-buffer, arrow-cast, arrow-ipc, arrow-schema, arrow-select, parquet)
+  Copyright 2016-2026 The Apache Software Foundation
+  Licensed under the Apache License, Version 2.0.
+
+* DuckDB / duckdb-neo / duckdb-loadable-macros / extension-ci-tools
+  Copyright 2018-2026 Stichting DuckDB Foundation and contributors
+  Licensed under the MIT License.
+
+* Zstandard (zstd C library, statically bundled by zstd-sys)
+  Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+  Licensed under the BSD 3-Clause License (dual-licensed with GPL-2.0; used under BSD-3-Clause).
+
+* Brotli (brotli, brotli-decompressor, alloc-no-stdlib, alloc-stdlib)
+  Copyright (c) 2016 Dropbox, Inc.
+  Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.
+  Licensed under the BSD 3-Clause License and the MIT License.
+
+* lz4_flex (Copyright (c) 2020 Pascal Seitz), twox-hash, zstd, zstd-safe
+  Licensed under the MIT License (zstd-safe: MIT OR Apache-2.0).

@@ -1,0 +1,301 @@
+# name: test/sql/bolt_types.test
+# description: Type round-trips through COPY ... TO (FORMAT bolt), bolt_scan, and COPY ... FROM, compared with plain DuckDB
+# group: [bolt]
+#
+# Runs on both backends (cuda-gpu and host-planner-fallback). The Bolt catalog is process-wide,
+# so this file uses its own table names and clears the catalog at start and end.
+#
+# Report 1.1.2 (fixed by RFC-008): TIMESTAMPTZ keeps its type through COPY and bolt_scan; its
+#   round trip and predicates in non-UTC session time zones are in bolt_timestamptz.test.
+# Report 1.1.4 (fixed): COPY <t> FROM '<bolt>' converts into the destination's original narrow
+#   types (section 4b); out-of-range values are an error (section 4c).
+# Report 1.1.9 (fixed): negative Arrow decimal scales are rejected; not reachable from DuckDB
+#   types, so covered by the Rust unit tests only.
+
+require bolt
+
+statement ok
+PRAGMA bolt_clear_tables;
+
+statement ok
+CREATE TABLE types_src (
+    id INTEGER,
+    c_i8 TINYINT,
+    c_i16 SMALLINT,
+    c_i32 INTEGER,
+    c_i64 BIGINT,
+    c_u8 UTINYINT,
+    c_u16 USMALLINT,
+    c_u32 UINTEGER,
+    c_u64 UBIGINT,
+    c_i128 HUGEINT,
+    c_f32 FLOAT,
+    c_f64 DOUBLE,
+    c_dec4 DECIMAL(4, 1),
+    c_dec9 DECIMAL(9, 2),
+    c_dec18 DECIMAL(18, 4),
+    c_dec38 DECIMAL(38, 6),
+    c_bool BOOLEAN,
+    c_str VARCHAR,
+    c_date DATE,
+    c_ts TIMESTAMP,
+    c_ts_s TIMESTAMP_S,
+    c_ts_ms TIMESTAMP_MS,
+    c_ts_ns TIMESTAMP_NS
+);
+
+# Boundary values for every type (UBIGINT / HUGEINT limited to the i64 range Bolt accepts),
+# a row of zeros / empty values, and a row of NULLs.
+statement ok
+INSERT INTO types_src VALUES
+    (1, -128, -32768, -2147483648, -9223372036854775808, 0, 0, 0, 0, -9223372036854775808,
+     -3.5, -1.0e300, -999.9, -9999999.99, -99999999999999.9999, -12345678901234567890123456789012.123456,
+     false, 'a', DATE '0001-01-01', TIMESTAMP '1677-09-22 00:00:00', TIMESTAMP_S '1677-09-22 00:00:00',
+     TIMESTAMP_MS '1677-09-22 00:00:00.001', TIMESTAMP_NS '1677-09-22 00:00:00.000000001'),
+    (2, 127, 32767, 2147483647, 9223372036854775807, 255, 65535, 4294967295, 9223372036854775807, 9223372036854775807,
+     3.5, 1.0e300, 999.9, 9999999.99, 99999999999999.9999, 12345678901234567890123456789012.123456,
+     true, 'it''s a string longer than twelve bytes', DATE '9999-12-31', TIMESTAMP '2262-04-11 23:47:16',
+     TIMESTAMP_S '2262-04-11 23:47:16', TIMESTAMP_MS '2262-04-11 23:47:16.854', TIMESTAMP_NS '2262-04-10 00:00:00.123456789'),
+    (3, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+     0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+     false, '', DATE '1970-01-01', TIMESTAMP '1970-01-01 00:00:00', TIMESTAMP_S '1970-01-01 00:00:00',
+     TIMESTAMP_MS '1970-01-01 00:00:00', TIMESTAMP_NS '1970-01-01 00:00:00'),
+    (4, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+     1.25, 2.5, 9.9, 123.45, 1000.1234, 999999.123456,
+     true, 'ñandú 漢字', DATE '2026-03-01', TIMESTAMP '2026-03-01 01:02:03.456789', TIMESTAMP_S '2026-03-01 01:02:03',
+     TIMESTAMP_MS '2026-03-01 01:02:03.456', TIMESTAMP_NS '2026-03-01 01:02:03.456789123'),
+    (5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+     NULL, NULL, NULL, NULL, NULL, NULL,
+     NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+
+statement ok
+COPY types_src TO 'gpu_types' (FORMAT bolt, USE_TMP_FILE FALSE);
+
+query II
+SELECT num_rows, num_columns FROM bolt_tables() WHERE table_name = 'gpu_types';
+----
+5	23
+
+# 1. Scanned-back types are the original DuckDB types (RFC-008: recorded in Arrow field metadata).
+query TTTTT
+SELECT typeof(c_i8), typeof(c_i16), typeof(c_i32), typeof(c_u8), typeof(c_u16) FROM bolt_scan('gpu_types') LIMIT 1;
+----
+TINYINT	SMALLINT	INTEGER	UTINYINT	USMALLINT
+
+query TTTT
+SELECT typeof(c_i64), typeof(c_u32), typeof(c_u64), typeof(c_i128) FROM bolt_scan('gpu_types') LIMIT 1;
+----
+BIGINT	UINTEGER	UBIGINT	HUGEINT
+
+query TTTTTT
+SELECT typeof(c_f32), typeof(c_f64), typeof(c_dec4), typeof(c_dec9), typeof(c_dec18), typeof(c_dec38) FROM bolt_scan('gpu_types') LIMIT 1;
+----
+FLOAT	DOUBLE	DECIMAL(4,1)	DECIMAL(9,2)	DECIMAL(18,4)	DECIMAL(38,6)
+
+query TTTTTTT
+SELECT typeof(c_bool), typeof(c_str), typeof(c_date), typeof(c_ts), typeof(c_ts_s), typeof(c_ts_ms), typeof(c_ts_ns) FROM bolt_scan('gpu_types') LIMIT 1;
+----
+BOOLEAN	VARCHAR	DATE	TIMESTAMP	TIMESTAMP_S	TIMESTAMP_MS	TIMESTAMP_NS
+
+# 2. Every value round-trips: the symmetric difference with the source is empty.
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM types_src EXCEPT ALL SELECT * FROM bolt_scan('gpu_types'))
+    UNION ALL
+    (SELECT * FROM bolt_scan('gpu_types') EXCEPT ALL SELECT * FROM types_src)
+);
+----
+0
+
+# The same through the replacement scans.
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM types_src EXCEPT ALL SELECT * FROM bolt.gpu_types)
+    UNION ALL
+    (SELECT * FROM 'bolt:gpu_types' EXCEPT ALL SELECT * FROM types_src)
+);
+----
+0
+
+# NULLs survive in every column.
+query I
+SELECT count(*) FROM bolt_scan('gpu_types')
+WHERE id = 5 AND c_i8 IS NULL AND c_i16 IS NULL AND c_i32 IS NULL AND c_i64 IS NULL
+  AND c_u8 IS NULL AND c_u16 IS NULL AND c_u32 IS NULL AND c_u64 IS NULL AND c_i128 IS NULL
+  AND c_f32 IS NULL AND c_f64 IS NULL AND c_dec4 IS NULL AND c_dec9 IS NULL AND c_dec18 IS NULL
+  AND c_dec38 IS NULL AND c_bool IS NULL AND c_str IS NULL AND c_date IS NULL AND c_ts IS NULL
+  AND c_ts_s IS NULL AND c_ts_ms IS NULL AND c_ts_ns IS NULL;
+----
+1
+
+# Spot-check the rendering of a few values (empty string vs NULL, unicode, decimals, ns precision).
+query TTTT rowsort
+SELECT id::VARCHAR, c_str, c_dec38::VARCHAR, c_ts_ns::VARCHAR FROM bolt_scan('gpu_types') WHERE id IN (3, 4, 5);
+----
+3	(empty)	0.000000	1970-01-01 00:00:00
+4	ñandú 漢字	999999.123456	2026-03-01 01:02:03.456789123
+5	NULL	NULL	NULL
+
+# 3. Values outside the i64 range are rejected at upload instead of being wrapped.
+statement error
+COPY (SELECT 9223372036854775808::UBIGINT AS u) TO 'gpu_types_overflow' (FORMAT bolt, USE_TMP_FILE FALSE);
+----
+exceeds
+
+statement error
+COPY (SELECT (-9223372036854775808)::HUGEINT - 1 AS h) TO 'gpu_types_overflow' (FORMAT bolt, USE_TMP_FILE FALSE);
+----
+
+query I
+SELECT count(*) FROM bolt_tables() WHERE table_name = 'gpu_types_overflow';
+----
+0
+
+# Unsupported types are rejected with a clear error.
+statement error
+COPY (SELECT INTERVAL 1 DAY AS iv) TO 'gpu_types_unsupported' (FORMAT bolt, USE_TMP_FILE FALSE);
+----
+Unsupported
+
+statement error
+COPY (SELECT [1, 2] AS l) TO 'gpu_types_unsupported' (FORMAT bolt, USE_TMP_FILE FALSE);
+----
+Unsupported
+
+# 4. COPY ... FROM into a table declared with the storage types round-trips every value.
+statement ok
+CREATE TABLE types_back (
+    id INTEGER,
+    c_i8 INTEGER,
+    c_i16 INTEGER,
+    c_i32 INTEGER,
+    c_i64 BIGINT,
+    c_u8 INTEGER,
+    c_u16 INTEGER,
+    c_u32 BIGINT,
+    c_u64 BIGINT,
+    c_i128 BIGINT,
+    c_f32 FLOAT,
+    c_f64 DOUBLE,
+    c_dec4 DECIMAL(4, 1),
+    c_dec9 DECIMAL(9, 2),
+    c_dec18 DECIMAL(18, 4),
+    c_dec38 DECIMAL(38, 6),
+    c_bool BOOLEAN,
+    c_str VARCHAR,
+    c_date DATE,
+    c_ts TIMESTAMP,
+    c_ts_s TIMESTAMP_S,
+    c_ts_ms TIMESTAMP_MS,
+    c_ts_ns TIMESTAMP_NS
+);
+
+statement ok
+COPY types_back FROM 'gpu_types' (FORMAT bolt);
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM types_src EXCEPT ALL SELECT * FROM types_back)
+    UNION ALL
+    (SELECT * FROM types_back EXCEPT ALL SELECT * FROM types_src)
+);
+----
+0
+
+# 4b. COPY ... FROM into a table with the *original* (narrow) types round-trips every value.
+statement ok
+CREATE TABLE types_src_copy AS SELECT * FROM types_src LIMIT 0;
+
+statement ok
+COPY types_src_copy FROM 'gpu_types' (FORMAT bolt);
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM types_src EXCEPT ALL SELECT * FROM types_src_copy)
+    UNION ALL
+    (SELECT * FROM types_src_copy EXCEPT ALL SELECT * FROM types_src)
+);
+----
+0
+
+query TTTTT
+SELECT typeof(c_i8), typeof(c_i16), typeof(c_u8), typeof(c_u64), typeof(c_i128) FROM types_src_copy LIMIT 1;
+----
+TINYINT	SMALLINT	UTINYINT	UBIGINT	HUGEINT
+
+# 4c. A stored value that does not fit the destination type is an error, not a wrapped value or NULL.
+statement ok
+COPY (SELECT 70000::INTEGER AS v) TO 'gpu_types_narrow' (FORMAT bolt, USE_TMP_FILE FALSE);
+
+statement ok
+CREATE TABLE types_narrow_dest (v SMALLINT);
+
+statement error
+COPY types_narrow_dest FROM 'gpu_types_narrow' (FORMAT bolt);
+----
+
+query I
+SELECT count(*) FROM types_narrow_dest;
+----
+0
+
+# A destination type Craton Bolt cannot produce is rejected at bind.
+statement ok
+CREATE TABLE types_blob_dest (v BLOB);
+
+statement error
+COPY types_blob_dest FROM 'gpu_types_narrow' (FORMAT bolt);
+----
+cannot produce
+
+# 5. Large tables: more than one 2,048-row chunk, and several stored batches via MODE 'append'.
+statement ok
+CREATE TABLE big_src AS
+SELECT i::INTEGER AS id, (i * 3)::BIGINT AS v, 'row_' || i::VARCHAR AS s,
+       CASE WHEN i % 7 = 0 THEN NULL ELSE i * 0.5 END::DOUBLE AS d
+FROM range(0, 5000) t(i);
+
+statement ok
+COPY big_src TO 'gpu_big' (FORMAT bolt, USE_TMP_FILE FALSE);
+
+query IIII
+SELECT count(*), sum(id), sum(v), count(DISTINCT s) FROM bolt_scan('gpu_big');
+----
+5000	12497500	37492500	5000
+
+statement ok
+INSERT INTO big_src
+SELECT i::INTEGER, (i * 3)::BIGINT, 'row_' || i::VARCHAR, CASE WHEN i % 7 = 0 THEN NULL ELSE i * 0.5 END::DOUBLE
+FROM range(5000, 7000) t(i);
+
+statement ok
+COPY (SELECT * FROM big_src WHERE id >= 5000) TO 'gpu_big' (FORMAT bolt, MODE 'append', USE_TMP_FILE FALSE);
+
+query II
+SELECT num_rows, num_columns FROM bolt_tables() WHERE table_name = 'gpu_big';
+----
+7000	4
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM big_src EXCEPT ALL SELECT * FROM bolt_scan('gpu_big'))
+    UNION ALL
+    (SELECT * FROM bolt_scan('gpu_big') EXCEPT ALL SELECT * FROM big_src)
+);
+----
+0
+
+# A filter whose matches straddle the two stored batches.
+query II
+SELECT count(*), sum(id) FROM bolt_scan('gpu_big') WHERE id >= 4990 AND id < 5010;
+----
+20	99990
+
+# bolt_query over the multi-batch table agrees with DuckDB.
+query I
+SELECT (SELECT sum(v) FROM big_src WHERE d IS NULL) = (SELECT total FROM bolt_query('SELECT SUM(v) AS total FROM gpu_big WHERE d IS NULL'));
+----
+true
+
+statement ok
+PRAGMA bolt_clear_tables;

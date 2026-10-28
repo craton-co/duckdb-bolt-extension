@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Dependabot version updates for Cargo and GitHub Actions.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # arrow / parquet must stay on the same major as craton-bolt's arrow dependency.
+      arrow:
+        patterns:
+          - "arrow*"
+          - "parquet"
+    ignore:
+      # duckdb-neo / duckdb-loadable-macros versions encode the target DuckDB version and are
+      # bumped together with the Makefile, workflow, and submodule by ./upgrade.sh.
+      - dependency-name: "duckdb-neo"
+      - dependency-name: "duckdb-loadable-macros"
+      # Arrow majors must match the arrow major used by craton-bolt.
+      - dependency-name: "arrow*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "parquet"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    ignore:
+      # Pinned to the extension-ci-tools submodule commit; bumped with ./upgrade.sh.
+      - dependency-name: "duckdb/extension-ci-tools"

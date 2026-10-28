@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[workspace]
+members = ["crates/core", "crates/native", "crates/wasm"]
+default-members = ["crates/core"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+authors = ["Craton Software Company <opensource@craton.com.ar>"]
+description = "DuckDB extension for the Craton Bolt JIT-compiled GPU SQL engine"
+repository = "https://github.com/craton-co/duckdb-bolt-extension"
+homepage = "https://craton.com.ar"
+documentation = "https://docs.rs/duckdb-bolt-core"
+keywords = ["duckdb", "gpu", "cuda", "sql", "arrow"]
+categories = ["database"]
+
+[workspace.dependencies]
+duckdb-neo = { version = "0.20000.0", default-features = false }
+duckdb-loadable-macros = { version = "1.20000.0", features = ["neo"] }
+duckdb_bolt_core = { package = "duckdb-bolt-core", version = "0.1.0", path = "crates/core" }
+arrow = { version = "53", default-features = false, features = ["ffi"] }
+arrow-array = "53"
+arrow-buffer = "53"
+arrow-cast = "53"
+arrow-schema = "53"
+arrow-select = "53"
+# W3-D-001: LZ4_FRAME / ZSTD compressed IPC (Feather v2) files. `zstd` is the implicit feature of
+# the optional `zstd` dependency (arrow-ipc 53 declares only `lz4`).
+arrow-ipc = { version = "53", features = ["lz4", "zstd"] }
+# W3-D-001: every codec DuckDB's `read_parquet` decodes. `zstd` compiles the zstd C library
+# with `cc` (no bindgen); `lz4` (lz4_flex), `brotli`, `snap` and `flate2` (rust_backend) are pure Rust.
+parquet = { version = "53", default-features = false, features = ["arrow", "snap", "flate2", "zstd", "lz4", "brotli"] }
+craton-bolt = "0.9.0"
+
+[profile.release]
+lto = "thin"
+strip = true
+

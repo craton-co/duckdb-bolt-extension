@@ -1,0 +1,56 @@
+# name: test/sql/bolt_w9d_validation.test
+# description: bolt_aggregate fragment and bolt_ptx_cache_dir validation gaps (W9-D-001, W9-D-002)
+# group: [bolt]
+#
+# Runs on both backends. Every statement fails during validation, before any table is looked up
+# or any file is touched, so the file registers nothing.
+
+require bolt
+
+# W9-D-002: quoting that the fragment scan does not model is refused. Each fragment below hides a
+# `--` comment (which would swallow the generated FROM clause) behind a quote character inside a
+# backtick identifier, a dollar-quoted string, or an E'...' escape string.
+statement error
+SELECT * FROM bolt_aggregate('w9d_missing', '', 'count(`a''`) -- '')');
+----
+backticks
+
+statement error
+SELECT * FROM bolt_aggregate('w9d_missing', '', 'count($$''$$) -- '')');
+----
+must not contain '$'
+
+statement error
+SELECT * FROM bolt_aggregate('w9d_missing', '', 'count(*) FILTER (WHERE s = E''\'''') -- '')');
+----
+backslashes
+
+# An escape string reopened after a doubled quote is still an escape string.
+statement error
+SELECT * FROM bolt_aggregate('w9d_missing', '', 'count(*) FILTER (WHERE s = E''a''''\'''') -- '')');
+----
+backslashes
+
+statement error
+SELECT * FROM bolt_aggregate('w9d_missing', 'g -- ', 'count(*)');
+----
+comments
+
+# Fragments that pass validation reach the table lookup: a backslash in an ordinary string, an
+# escape string without one, a doubled quote, and `$` / backticks inside a string.
+statement error
+SELECT * FROM bolt_aggregate('w9d_missing', '', 'max(s) FILTER (WHERE s <> ''x\'')');
+----
+not registered
+
+statement error
+SELECT * FROM bolt_aggregate('w9d_missing', 'g', 'max(s) FILTER (WHERE s <> E''x'' AND s <> ''it''''s $1 `q`'')');
+----
+not registered
+
+# W9-D-001: `..` components are refused (on Windows the path below is not absolute either; both
+# messages start the same way).
+statement error
+SET bolt_ptx_cache_dir = '/w9d_missing_dir/../../tmp/w9d_ptx';
+----
+bolt_ptx_cache_dir must

@@ -1,0 +1,85 @@
+# name: test/sql/bolt_sandbox.test
+# description: bolt_load_* and bolt_ptx_cache_dir honor enable_external_access = false
+# group: [bolt]
+#
+# enable_external_access cannot be turned back on in a running database, so this file needs its
+# own database (both DuckDB's unittest and the Rust runner open a fresh one per file). No file is
+# read or created: the checks run before any file-system access, and a missing file must get the
+# same Permission Error as a forbidden one (no existence oracle).
+
+require bolt
+
+statement ok
+PRAGMA bolt_clear_tables;
+
+statement ok
+COPY (SELECT 1::INTEGER AS v) TO 'sbx_ok' (FORMAT bolt, USE_TMP_FILE FALSE);
+
+statement ok
+SET enable_external_access = false;
+
+statement error
+SELECT bolt_load_parquet('sbx_t', '__bolt_sandbox_missing.parquet');
+----
+enable_external_access
+
+statement error
+SELECT bolt_load_parquet('sbx_t', '__bolt_sandbox_missing.parquet', 'append');
+----
+enable_external_access
+
+statement error
+SELECT bolt_load_arrow_ipc('sbx_t', '__bolt_sandbox_missing.arrow');
+----
+enable_external_access
+
+# Remote URLs are refused as well.
+statement error
+SELECT bolt_load_parquet('sbx_t', 's3://bucket/data.parquet');
+----
+file system operations are disabled
+
+query I
+SELECT count(*) FROM bolt_tables() WHERE table_name = 'sbx_t';
+----
+0
+
+# NULL arguments return NULL and touch nothing.
+query II
+SELECT bolt_load_parquet(NULL, 'x.parquet'), bolt_load_arrow_ipc('sbx_t', NULL);
+----
+NULL	NULL
+
+# The PTX cache directory cannot be pointed anywhere while sandboxed (checked before the path is
+# inspected, so even a relative path gets the permission error) ...
+statement error
+SET bolt_ptx_cache_dir = '/bolt_sandbox_ptx_dir';
+----
+enable_external_access
+
+statement error
+SET bolt_ptx_cache_dir = 'relative_ptx_dir';
+----
+enable_external_access
+
+# ... but disabling it is always allowed.
+statement ok
+SET bolt_ptx_cache_dir = '';
+
+statement ok
+RESET bolt_ptx_cache_dir;
+
+query I
+SELECT current_setting('bolt_ptx_cache_dir');
+----
+(empty)
+
+# Scanning a table registered before the sandbox was enabled touches no files and keeps working.
+# (COPY ... TO itself is subject to DuckDB's own COPY permission check, so it is not used here.)
+query I
+SELECT count(*) FROM bolt_scan('sbx_ok');
+----
+1
+
+statement ok
+PRAGMA bolt_clear_tables;

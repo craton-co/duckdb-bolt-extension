@@ -1,0 +1,71 @@
+# name: test/sql/bolt_call.test
+# description: CALL / table-function forms of the catalog mutations act once per execution (W4-C-004)
+# group: [bolt]
+#
+# Runs on both backends. The Bolt catalog is process-wide: this file uses its own `call_*` table
+# names and clears the catalog at start and end.
+
+require bolt
+
+statement ok
+PRAGMA bolt_clear_tables;
+
+statement ok
+COPY (SELECT range::INTEGER AS id FROM range(10)) TO 'call_src' (FORMAT bolt, USE_TMP_FILE FALSE);
+
+query I
+CALL bolt_register_sql('call_r', 'SELECT id FROM call_src WHERE id < 4');
+----
+4
+
+query I
+CALL bolt_register_sql('call_r', 'SELECT id FROM call_src WHERE id < 4', mode := 'append');
+----
+8
+
+statement error
+CALL bolt_register_sql('call_r', 'SELECT id FROM call_src', 'sideways');
+----
+bolt_register_sql
+
+# EXPLAIN binds without executing: nothing is dropped.
+statement ok
+EXPLAIN CALL bolt_drop_table('call_r');
+
+query I
+SELECT num_rows FROM bolt_tables() WHERE table_name = 'call_r';
+----
+8
+
+query I
+CALL bolt_drop_table('call_r');
+----
+true
+
+query I
+CALL bolt_drop_table('call_r');
+----
+false
+
+statement ok
+SET threads = 8;
+
+# One execution clears once, whatever the thread count.
+query I
+SELECT * FROM bolt_clear_tables();
+----
+1
+
+query I
+CALL bolt_clear_tables();
+----
+0
+
+statement ok
+RESET threads;
+
+# The scalar forms of the same names are unchanged.
+query I
+SELECT bolt_clear_tables();
+----
+0

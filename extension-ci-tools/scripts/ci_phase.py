@@ -1,0 +1,1047 @@
+#!/usr/bin/env python3
+"""Run command-based phases of the extension distribution workflow.
+
+GitHub actions that need ``uses:`` remain in the workflow.  Everything else is
+kept here so optional operations do not each become a top-level Actions step.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+from typing import Mapping, Sequence
+import urllib.error
+import urllib.request
+
+
+TRUE_VALUES = {"1", "true", "yes", "on"}
+DEFAULT_PREBUILT_DUCKDB_BASE_URL = "https://duckdb-staging.duckdb.org"
+PREBUILT_DUCKDB_ARTIFACTS = {
+    "linux_amd64": "duckdb-static-libs-linux-amd64.tar.gz",
+    "linux_arm64": "duckdb-static-libs-linux-arm64.tar.gz",
+    "linux_amd64_musl": "duckdb-static-libs-linux-amd64-musl.tar.gz",
+    "linux_arm64_musl": "duckdb-static-libs-linux-arm64-musl.tar.gz",
+    "osx_amd64": "duckdb-static-libs-osx-amd64.tar.gz",
+    "osx_arm64": "duckdb-static-libs-osx-arm64.tar.gz",
+    "windows_amd64": "duckdb-static-libs-windows-amd64.tar.gz",
+    "windows_arm64": "duckdb-static-libs-windows-arm64.tar.gz",
+    "windows_amd64_mingw": "duckdb-static-libs-windows-mingw.tar.gz",
+}
+PREBUILT_DUCKDB_USER_AGENT = "duckdb-extension-ci-tools/prebuilt-duckdb"
+STAGED_DUCKDB_VERSION_PATTERN = re.compile(
+    r"^v([0-9]+)\.([0-9]+)\.([0-9]+)(?:-(alpha|rc|dev)([0-9]+))?$"
+)
+DUCKDB_VERSION_STAGE_RANK = {"dev": 0, "alpha": 1, "rc": 2, None: 3}
+
+# Intel Homebrew is deprecated; keep this installer pin only while osx_amd64 is
+# supported. See https://github.com/Homebrew/brew/blob/main/docs/Support-Tiers.md#future-macos-support
+INTEL_HOMEBREW_INSTALLER = (
+    "https://raw.githubusercontent.com/Homebrew/install/"
+    "0f5b7666a65fc2d1a2615549f02771353c250f9a/install.sh"
+)
+
+
+def format_command(command: Sequence[str] | str) -> str:
+    return command if isinstance(command, str) else shlex.join(command)
+
+
+def format_windows_command(command: Sequence[str]) -> str:
+    """Serialize an argument list for execution by cmd.exe on Windows."""
+    return subprocess.list2cmdline(command)
+
+
+def is_true(value: str | None) -> bool:
+    return (value or "").lower() in TRUE_VALUES
+
+
+def tool_enabled(toolchains: str, tool: str) -> bool:
+    return f";{tool};" in f";{toolchains.strip(';')};"
+
+
+def prebuilt_duckdb_artifact_name(architecture: str) -> str:
+    return PREBUILT_DUCKDB_ARTIFACTS.get(architecture, "")
+
+
+def highest_duckdb_version_tag(tags: Sequence[str]) -> str:
+    versions: list[tuple[tuple[int, int, int, int, int], str]] = []
+    for tag in tags:
+        match = STAGED_DUCKDB_VERSION_PATTERN.fullmatch(tag)
+        if match is None:
+            continue
+        major, minor, patch, stage, stage_number = match.groups()
+        versions.append(
+            (
+                (
+                    int(major),
+                    int(minor),
+                    int(patch),
+                    DUCKDB_VERSION_STAGE_RANK[stage],
+                    int(stage_number or 0),
+                ),
+                tag,
+            )
+        )
+    if not versions:
+        return ""
+    return max(versions)[1]
+
+
+def test_environment(config: str) -> dict[str, str]:
+    parsed = json.loads(config or "{}")
+    values = parsed.get("test_env_variables", {})
+    if not isinstance(values, dict):
+        raise ValueError("test_env_variables must be a JSON object")
+    def stringify(value: object) -> str:
+        if isinstance(value, bool):
+            return str(value).lower()
+        if value is None:
+            return "null"
+        return str(value)
+
+    return {str(key): stringify(value) for key, value in values.items()}
+
+
+def extra_dependencies(config: str, architecture: str) -> list[str]:
+    if not config:
+        return []
+    parsed = json.loads(config)
+    values = parsed.get(architecture, [])
+    if not isinstance(values, list):
+        raise ValueError(f"vcpkg dependencies for {architecture} must be a list")
+    return [str(value) for value in values]
+
+
+class PhaseRunner:
+    def __init__(self, environ: Mapping[str, str] | None = None) -> None:
+        self.env = dict(os.environ if environ is None else environ)
+        self.platform = self.required("CI_PLATFORM")
+        self.architecture = self.required("DUCKDB_PLATFORM")
+        self.workspace = Path(self.env.get("GITHUB_WORKSPACE", ".")).resolve()
+
+    def value(self, name: str, default: str = "") -> str:
+        return self.env.get(name, default)
+
+    def duckdb_ref(self) -> str:
+        return self.value("DUCKDB_COMMIT") or self.value("DUCKDB_VERSION")
+
+    def required(self, name: str) -> str:
+        value = self.value(name)
+        if not value:
+            raise ValueError(f"missing required environment variable: {name}")
+        return value
+
+    def enabled(self, name: str) -> bool:
+        return is_true(self.value(name))
+
+    def run(
+        self,
+        command: Sequence[str] | str,
+        *,
+        extra_env: Mapping[str, str] | None = None,
+        shell: bool = False,
+        cwd: Path | None = None,
+    ) -> None:
+        environment = self.env.copy()
+        if extra_env:
+            environment.update(extra_env)
+        print(f"+ {format_command(command)}", flush=True)
+        options = {
+            "check": True,
+            "cwd": cwd or self.workspace,
+            "env": environment,
+            "shell": shell,
+        }
+        if shell and os.name != "nt":
+            options["executable"] = shutil.which("bash") or "/bin/bash"
+        subprocess.run(command, **options)
+
+    def capture(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Path | None = None,
+    ) -> str:
+        print(f"+ {format_command(command)}", flush=True)
+        completed = subprocess.run(
+            command,
+            check=True,
+            cwd=cwd or self.workspace,
+            env=self.env.copy(),
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        return completed.stdout.strip()
+
+    def append_github_file(self, variable: str, name: str, value: str) -> None:
+        destination = self.value(variable)
+        if not destination:
+            return
+        with open(destination, "a", encoding="utf-8") as handle:
+            handle.write(f"{name}={value}\n")
+
+    def set_environment(self, name: str, value: str) -> None:
+        self.env[name] = value
+        self.append_github_file("GITHUB_ENV", name, value)
+
+    def add_path(self, value: Path) -> None:
+        self.env["PATH"] = f"{value}{os.pathsep}{self.env.get('PATH', '')}"
+        destination = self.value("GITHUB_PATH")
+        if destination:
+            with open(destination, "a", encoding="utf-8") as handle:
+                handle.write(f"{value}\n")
+
+    def retry_prefix(self) -> list[str]:
+        retry_script = self.workspace / "duckdb" / "scripts" / "ci" / "retry.py"
+        return [sys.executable, str(retry_script), "--"] if retry_script.is_file() else []
+
+    def run_with_retry(
+        self, command: Sequence[str], *, extra_env: Mapping[str, str] | None = None
+    ) -> None:
+        self.run([*self.retry_prefix(), *command], extra_env=extra_env)
+
+    def checkout(self) -> None:
+        duckdb_repository = self.value("CI_DUCKDB_GIT_REPOSITORY")
+        duckdb_ref = self.duckdb_ref()
+        duckdb_directory = self.workspace / "duckdb"
+        if not duckdb_directory.is_dir():
+            self.run(
+                [
+                    "git",
+                    "clone",
+                    duckdb_repository or "https://github.com/duckdb/duckdb.git",
+                    "duckdb",
+                ]
+            )
+        elif duckdb_repository:
+            self.run(
+                ["git", "-C", "duckdb", "remote", "set-url", "origin", duckdb_repository]
+            )
+        if duckdb_ref:
+            self.run(["git", "-C", "duckdb", "fetch", "origin", duckdb_ref])
+            self.run(["git", "-C", "duckdb", "checkout", duckdb_ref])
+
+        duckdb_version = self.value("DUCKDB_VERSION")
+        if not duckdb_version:
+            self.run(["git", "-C", "duckdb", "fetch", "origin", "--tags", "--force"])
+            tags = sorted(
+                filter(
+                    None,
+                    self.capture(
+                        ["git", "-C", "duckdb", "tag", "--points-at", "HEAD"]
+                    ).splitlines(),
+                )
+            )
+            print(
+                "DuckDB tags pointing at HEAD: "
+                + (", ".join(tags) if tags else "(none)"),
+                flush=True,
+            )
+            duckdb_version = highest_duckdb_version_tag(tags)
+            if duckdb_version:
+                print(
+                    f"Selected DuckDB version tag: {duckdb_version}",
+                    flush=True,
+                )
+            else:
+                duckdb_version = self.capture(
+                    ["git", "-C", "duckdb", "rev-parse", "HEAD"]
+                )
+                print(
+                    f"No supported DuckDB version tag found; using commit: {duckdb_version}",
+                    flush=True,
+                )
+            if not duckdb_version:
+                raise ValueError("could not resolve the DuckDB checkout version")
+        self.set_environment("DUCKDB_VERSION", duckdb_version)
+        self.append_github_file("GITHUB_OUTPUT", "duckdb_version", duckdb_version)
+
+        extension_tag = self.value("CI_EXTENSION_TAG")
+        if extension_tag:
+            self.run(["git", "tag", extension_tag])
+
+        duckdb_tag = self.value("DUCKDB_TAG")
+        if duckdb_tag:
+            self.run(["make", "set_duckdb_tag"], extra_env={"DUCKDB_TAG": duckdb_tag})
+
+        if self.enabled("CI_FETCH_PREBUILT_DUCKDB"):
+            self.prebuilt()
+
+    def _open_prebuilt_url(self, url: str):
+        request = urllib.request.Request(
+            url, headers={"User-Agent": PREBUILT_DUCKDB_USER_AGENT}
+        )
+        return urllib.request.urlopen(request, timeout=60)
+
+    def _prebuilt_cache_miss(self, url: str, error: Exception) -> None:
+        print(
+            f"Prebuilt DuckDB archive is unavailable; building DuckDB from source "
+            f"instead ({url}: {error}).",
+            flush=True,
+        )
+
+    def prebuilt(self) -> bool:
+        if self.value("CI_BUILD_TYPE", "release").lower() != "release":
+            print(
+                "Prebuilt DuckDB archives are only available for release builds; "
+                "building DuckDB from source.",
+                flush=True,
+            )
+            return False
+
+        artifact_name = self.value(
+            "CI_PREBUILT_DUCKDB_ARTIFACT"
+        ) or prebuilt_duckdb_artifact_name(self.architecture)
+        if not artifact_name:
+            print(
+                f"No prebuilt DuckDB archive is defined for {self.architecture}; "
+                "building DuckDB from source.",
+                flush=True,
+            )
+            return False
+
+        duckdb_commit = self.capture(
+            ["git", "-C", "duckdb", "rev-parse", "HEAD"]
+        ).lower()
+        if re.fullmatch(r"[a-f0-9]{10,64}", duckdb_commit) is None:
+            raise ValueError(f"invalid checked-out DuckDB commit: {duckdb_commit}")
+
+        short_commit = duckdb_commit[:10]
+        base_url = self.value(
+            "CI_PREBUILT_DUCKDB_BASE_URL", DEFAULT_PREBUILT_DUCKDB_BASE_URL
+        ).rstrip("/")
+        staged_version = self.value("DUCKDB_VERSION")
+        if STAGED_DUCKDB_VERSION_PATTERN.fullmatch(staged_version) is None:
+            version_url = f"{base_url}/{short_commit}/latest_alpha_version.txt"
+            try:
+                with self._open_prebuilt_url(version_url) as response:
+                    staged_version = response.read().decode("utf-8").strip()
+            except (OSError, urllib.error.URLError) as error:
+                self._prebuilt_cache_miss(version_url, error)
+                return False
+
+            if STAGED_DUCKDB_VERSION_PATTERN.fullmatch(staged_version) is None:
+                raise ValueError(
+                    f"invalid staged DuckDB version for {duckdb_commit}: {staged_version!r}"
+                )
+
+        artifact_url = (
+            f"{base_url}/{short_commit}/{staged_version}/duckdb/duckdb/"
+            f"github_release/{artifact_name}"
+        )
+        default_artifact_root = (
+            self.workspace / ".ci" / "prebuilt-duckdb" / self.architecture
+        )
+        artifact_root = Path(
+            self.value("CI_PREBUILT_DUCKDB_PATH", str(default_artifact_root))
+        )
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        destination = artifact_root / artifact_name
+        temporary = destination.with_name(f".{destination.name}.part")
+        try:
+            with self._open_prebuilt_url(artifact_url) as response:
+                with temporary.open("wb") as target:
+                    shutil.copyfileobj(response, target)
+            temporary.replace(destination)
+        except (OSError, urllib.error.URLError) as error:
+            temporary.unlink(missing_ok=True)
+            self._prebuilt_cache_miss(artifact_url, error)
+            return False
+
+        print(f"Using prebuilt DuckDB archive: {artifact_url}", flush=True)
+        self.set_environment("CI_PREBUILT_DUCKDB_ARTIFACT", artifact_name)
+        self.set_environment("CI_PREBUILT_DUCKDB_PATH", str(artifact_root.resolve()))
+        return True
+
+    def inject_extension_config(self) -> None:
+        config_parts: list[str] = []
+        raw_paths = self.value("CI_EXTENSION_CONFIG_PATHS", "[]")
+        paths = json.loads(raw_paths)
+        if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+            raise ValueError("CI_EXTENSION_CONFIG_PATHS must be a JSON string array")
+        for configured_path in paths:
+            path = Path(configured_path)
+            if not path.is_absolute():
+                path = self.workspace / path
+            if not path.is_file():
+                raise FileNotFoundError(f"extension config does not exist: {path}")
+            config_parts.append(path.read_text(encoding="utf-8").rstrip("\n"))
+        inline_config = self.value("CI_EXTRA_EXTENSION_CONFIG")
+        if inline_config:
+            config_parts.append(inline_config.rstrip("\n"))
+        config = "\n\n".join(part for part in config_parts if part)
+        if not config:
+            return
+        path = self.workspace / "extension_config.cmake"
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n# Injected Extension Config\n{config}\n")
+        print(path.read_text(encoding="utf-8"))
+
+    def install_vcpkg(self) -> None:
+        installation = self.workspace / "local_vcpkg_installation"
+        installation.mkdir()
+        self.run(["cmake", "--version"])
+        self.run(["git", "init"], cwd=installation)
+        self.run(
+            ["git", "remote", "add", "origin", self.required("CI_VCPKG_URL")],
+            cwd=installation,
+        )
+        commit = self.required("CI_VCPKG_COMMIT")
+        self.run(["git", "fetch", "origin", commit], cwd=installation)
+        self.run(["git", "checkout", commit], cwd=installation)
+        self.run([str(installation / "bootstrap-vcpkg.sh")], cwd=installation)
+        self.set_environment("VCPKG_ROOT", str(installation))
+        self.set_environment(
+            "VCPKG_TOOLCHAIN_PATH", str(installation / "scripts/buildsystems/vcpkg.cmake")
+        )
+        self.add_path(installation)
+
+    def install_extra_vcpkg_dependencies(self, *, docker: bool = False) -> None:
+        dependencies = extra_dependencies(
+            self.value("CI_VCPKG_EXTRA_DEPENDENCIES"), self.architecture
+        )
+        for dependency in dependencies:
+            if docker:
+                self.run(
+                    [
+                        "docker",
+                        "run",
+                        "--env-file=docker_env.txt",
+                        "-v",
+                        f"{self.workspace}:/duckdb_build_dir",
+                        f"duckdb/{self.architecture}",
+                        "vcpkg",
+                        "install",
+                        dependency,
+                        "--recurse",
+                    ]
+                )
+            else:
+                self.run(["vcpkg", "install", dependency, "--recurse"])
+
+    def setup_linux(self) -> None:
+        if self.enabled("CI_LINUX_NATIVE_CONTAINER"):
+            self.run_with_retry(
+                ["make", "configure_ci"],
+                extra_env=self.build_environment(),
+            )
+            return
+        if self.enabled("CI_USE_DEFAULT_RUNNERS"):
+            if self.enabled("CI_RUN_DISK_CLEAN_STEP"):
+                images = subprocess.run(
+                    ["docker", "images", "-a", "-q"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.split()
+                if images:
+                    try:
+                        self.run(["docker", "rmi", *images])
+                    except subprocess.CalledProcessError as error:
+                        print(f"Warning: could not remove preinstalled Docker images: {error}")
+            self.run(["sudo", "systemctl", "stop", "docker"])
+            self.run(["sudo", "mkdir", "-p", "/mnt/docker-data"])
+            self.run(
+                "echo '{ \"data-root\": \"/mnt/docker-data\" }' | sudo tee /etc/docker/daemon.json",
+                shell=True,
+            )
+            self.run(["sudo", "systemctl", "start", "docker"])
+            self.run("docker info | grep 'Docker Root Dir'", shell=True)
+
+        self.run_with_retry(
+            ["make", "configure_ci"],
+            extra_env={
+                "DUCKDB_GIT_VERSION": self.duckdb_ref(),
+                "LINUX_CI_IN_DOCKER": "0",
+            },
+        )
+
+    def setup_macos(self) -> None:
+        self.run(["brew", "install", "ninja", "autoconf", "make", "libtool", "automake", "autoconf-archive"])
+        self.install_vcpkg()
+        tools = self.value("CI_EXTRA_TOOLCHAINS")
+        osx_arch = self.value("CI_OSX_BUILD_ARCH")
+        if tool_enabled(tools, "rust") and osx_arch == "x86_64":
+            self.run(["rustup", "target", "add", "x86_64-apple-darwin"])
+        if tool_enabled(tools, "fortran"):
+            self.run(["brew", "install", "gcc"])
+        if tool_enabled(tools, "parser_tools"):
+            self.run(["brew", "install", "bison", "flex"])
+        if tool_enabled(tools, "omp"):
+            self.setup_macos_omp()
+        if tool_enabled(tools, "unixodbc"):
+            self.setup_macos_unixodbc()
+        if tool_enabled(tools, "downgraded_aws_cli"):
+            self.run(["curl", "https://awscli.amazonaws.com/AWSCLIV2-2.22.35.pkg", "-o", "AWSCLIV2.pkg"])
+            self.run(["sudo", "installer", "-pkg", "AWSCLIV2.pkg", "-target", "/"])
+            self.run(["aws", "--version"])
+        self.run(["make", "configure_ci"], extra_env={"DUCKDB_GIT_VERSION": self.duckdb_ref()})
+        self.install_extra_vcpkg_dependencies()
+
+    def setup_macos_omp(self) -> None:
+        if self.architecture == "osx_amd64":
+            self.run(
+                f'arch -x86_64 /bin/bash -c "$(curl -fsSL {INTEL_HOMEBREW_INSTALLER})"',
+                shell=True,
+            )
+            self.run(["arch", "-x86_64", "/usr/local/bin/brew", "install", "libomp"])
+            prefix = "/usr/local/opt/libomp"
+        else:
+            self.run(["brew", "install", "libomp"])
+            prefix = "/opt/homebrew/opt/libomp"
+        self.set_environment("LDFLAGS", f"-L{prefix}/lib")
+        self.set_environment("CFLAGS", f"-I{prefix}/include")
+        self.set_environment("CPPFLAGS", f"-I{prefix}/include")
+        self.set_environment("CXXFLAGS", f"-I{prefix}/include")
+
+    def setup_macos_unixodbc(self) -> None:
+        if self.architecture == "osx_amd64":
+            self.run(
+                f'arch -x86_64 /bin/bash -c "$(curl -fsSL {INTEL_HOMEBREW_INSTALLER})"',
+                shell=True,
+            )
+            brew = "/usr/local/bin/brew"
+        else:
+            brew = "brew"
+        self.run([brew, "config"])
+        self.run([brew, "install", "unixodbc"])
+        self.run([brew, "ls", "-v", "unixodbc"])
+
+    def setup_windows(self) -> None:
+        tools = self.value("CI_EXTRA_TOOLCHAINS")
+        if tool_enabled(tools, "downgraded_aws_cli"):
+            command = (
+                "$app = Get-WmiObject -Class Win32_Product -Filter \"Name LIKE 'AWS Command Line Interface%'\"; "
+                "if ($app) { $app.Uninstall() }; "
+                "Start-Process msiexec.exe -ArgumentList '/i https://awscli.amazonaws.com/AWSCLIV2-2.22.35.msi /qn' -Wait"
+            )
+            self.run(["powershell", "-NoProfile", "-Command", command])
+        self.run(["aws", "--version"])
+        if tool_enabled(tools, "parser_tools"):
+            self.run(["choco", "install", "winflexbison3", "-y"])
+        self.run(["choco", "install", "ninja", "-y"])
+        self.run(["choco", "install", "jq", "-y"])
+
+        if self.architecture in {"windows_amd64_rtools", "windows_amd64_mingw"}:
+            root = Path("C:/rtools42/x86_64-w64-mingw32.static.posix/bin")
+            for source, destination in (
+                ("gcc.exe", "x86_64-w64-mingw32-gcc.exe"),
+                ("g++.exe", "x86_64-w64-mingw32-g++.exe"),
+                ("gfortran.exe", "x86_64-w64-mingw32-gfortran.exe"),
+            ):
+                shutil.copy2(root / source, root / destination)
+            zstd = Path("C:/rtools42/usr/bin/zstd.exe")
+            if zstd.exists():
+                zstd.rename(zstd.with_name("zstd-rtools.exe"))
+
+        self.run(["make", "configure_ci"], extra_env=self.build_environment())
+        self.install_extra_vcpkg_dependencies()
+
+    def setup_wasm(self) -> None:
+        self.install_vcpkg()
+        if tool_enabled(self.value("CI_EXTRA_TOOLCHAINS"), "downgraded_aws_cli"):
+            self.run(["curl", "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.22.35.zip", "-o", "awscliv2.zip"])
+            self.run(["unzip", "-q", "awscliv2.zip"])
+            self.run(["sudo", "./aws/install", "--update"])
+            self.run(["aws", "--version"])
+        self.run_with_retry(
+            ["make", "configure_ci"],
+            extra_env={"DUCKDB_GIT_VERSION": self.duckdb_ref()},
+        )
+        self.install_extra_vcpkg_dependencies()
+
+    def setup(self) -> None:
+        self.inject_extension_config()
+        getattr(self, f"setup_{self.platform}")()
+
+    def build_environment(self) -> dict[str, str]:
+        is_rtools = self.architecture in {"windows_amd64_rtools", "windows_amd64_mingw"}
+        return {
+            "DUCKDB_VERSION": self.value("DUCKDB_VERSION"),
+            "DUCKDB_COMMIT": self.value("DUCKDB_COMMIT"),
+            "DUCKDB_PLATFORM": self.architecture,
+            "DUCKDB_PLATFORM_RTOOLS": "1" if is_rtools else "0",
+            "DUCKDB_GIT_VERSION": self.duckdb_ref(),
+            "EXTENSION_NAME": self.required("CI_EXTENSION_NAME"),
+            "EXTENSION_CANONICAL": self.value("CI_EXTENSION_CANONICAL"),
+            "ENABLE_EXTENSION_AUTOINSTALL": "1",
+            "ENABLE_EXTENSION_AUTOLOADING": "1",
+            "DUCKDB_PREBUILT_LIBRARY": self.value("DUCKDB_PREBUILT_LIBRARY"),
+            "DUCKDB_PREBUILT_EXTENSIONS": self.value("DUCKDB_PREBUILT_EXTENSIONS"),
+        }
+
+    def prepare_prebuilt_duckdb(self) -> None:
+        artifact_name = self.value("CI_PREBUILT_DUCKDB_ARTIFACT")
+        if not artifact_name:
+            return
+
+        artifact_root = Path(self.required("CI_PREBUILT_DUCKDB_PATH"))
+        archives = [
+            path for path in artifact_root.rglob(artifact_name) if path.is_file()
+        ]
+        if len(archives) != 1:
+            raise FileNotFoundError(
+                f"expected one prebuilt DuckDB artifact named {artifact_name} below {artifact_root}, found {len(archives)}"
+            )
+
+        msvc = (
+            self.platform == "windows"
+            and self.architecture
+            not in {"windows_amd64_mingw", "windows_amd64_rtools"}
+        )
+        library_name = (
+            "duckdb_static.lib"
+            if msvc
+            else "libduckdb_static.a"
+        )
+        shell_library_name = "duckdb_shell.lib" if msvc else "libduckdb_shell.a"
+        # optional capabilities built as their own archives next to the DuckDB library
+        capability_library_names = (
+            {"duckdb_httplib.lib", "duckdb_loadable_extensions.lib"}
+            if msvc
+            else {"libduckdb_httplib.a", "libduckdb_loadable_extensions.a"}
+        )
+        extension_prefix = "" if msvc else "lib"
+        extension_suffix = "_extension.lib" if msvc else "_extension.a"
+        with tarfile.open(archives[0], "r:gz") as bundle:
+            selected_members: dict[str, tarfile.TarInfo] = {}
+            extension_names: list[str] = []
+            for member in bundle.getmembers():
+                if not member.isfile():
+                    continue
+                name = Path(member.name).name
+                is_extension = name.startswith(extension_prefix) and name.endswith(
+                    extension_suffix
+                )
+                if (
+                    name not in {library_name, shell_library_name}
+                    and name not in capability_library_names
+                    and not is_extension
+                ):
+                    continue
+                if name in selected_members:
+                    if name in {library_name, shell_library_name}:
+                        raise ValueError(
+                            f"expected one {name} in prebuilt DuckDB artifact {archives[0]}, found 2"
+                        )
+                    raise ValueError(
+                        f"duplicate prebuilt library {name} in DuckDB artifact {archives[0]}"
+                    )
+                selected_members[name] = member
+                if is_extension:
+                    extension_names.append(
+                        name[len(extension_prefix) : -len(extension_suffix)]
+                    )
+
+            if library_name not in selected_members:
+                raise ValueError(
+                    f"expected one {library_name} in prebuilt DuckDB artifact {archives[0]}, found 0"
+                )
+            if (
+                self.enabled("CI_BUILD_DUCKDB_SHELL")
+                and shell_library_name not in selected_members
+            ):
+                raise ValueError(
+                    f"expected one {shell_library_name} in prebuilt DuckDB artifact {archives[0]}, found 0"
+                )
+
+            destination_root = artifact_root / "extracted"
+            destination_root.mkdir(parents=True, exist_ok=True)
+            for name, member in selected_members.items():
+                source = bundle.extractfile(member)
+                if source is None:
+                    raise ValueError(
+                        f"could not read {name} from prebuilt DuckDB artifact {archives[0]}"
+                    )
+                with (destination_root / name).open("wb") as target:
+                    shutil.copyfileobj(source, target)
+
+        destination = artifact_root / "extracted" / library_name
+        self.set_environment("DUCKDB_PREBUILT_LIBRARY", str(destination.resolve()))
+        self.set_environment(
+            "DUCKDB_PREBUILT_EXTENSIONS", ";".join(sorted(extension_names))
+        )
+
+    def docker_arguments(self) -> list[str]:
+        return [
+            "docker",
+            "run",
+            "--env-file=docker_env.txt",
+            "-v",
+            f"{self.workspace}:/duckdb_build_dir",
+            "-v",
+            f"{self.workspace / '.ccache'}:/ccache_dir",
+            f"duckdb/{self.architecture}",
+        ]
+
+    def create_docker_environment(self) -> None:
+        values = {
+            "VCPKG_BINARY_SOURCES": self.value("VCPKG_BINARY_SOURCES"),
+            "USE_MERGED_VCPKG_MANIFEST": self.value("USE_MERGED_VCPKG_MANIFEST"),
+            "AWS_ACCESS_KEY_ID": self.value("AWS_ACCESS_KEY_ID"),
+            "AWS_SECRET_ACCESS_KEY": self.value("AWS_SECRET_ACCESS_KEY"),
+            "AWS_ENDPOINT_URL": self.value("AWS_ENDPOINT_URL"),
+            "AWS_DEFAULT_REGION": self.value("AWS_DEFAULT_REGION"),
+            "AWS_REQUEST_CHECKSUM_CALCULATION": "when_required",
+            "VCPKG_TARGET_TRIPLET": self.value("VCPKG_TARGET_TRIPLET"),
+            "VCPKG_OVERLAY_TRIPLETS": f"/duckdb_build_dir/{self.value('CI_VCPKG_OVERLAY_TRIPLETS')}",
+            "VCPKG_OVERLAY_PORTS": f"/duckdb_build_dir/{self.value('CI_VCPKG_OVERLAY_PORTS')}",
+            "CUDAARCHS": self.value("CI_CUDA_ARCHS"),
+            "VCPKG_CUDA_VERSION": self.value("CI_CUDA_VERSION"),
+            "BUILD_SHELL": "1" if self.enabled("CI_BUILD_DUCKDB_SHELL") else "0",
+            "OPENSSL_ROOT_DIR": f"/duckdb_build_dir/build/{self.value('CI_BUILD_TYPE')}/vcpkg_installed/{self.value('VCPKG_TARGET_TRIPLET')}",
+            "OPENSSL_DIR": f"/duckdb_build_dir/build/{self.value('CI_BUILD_TYPE')}/vcpkg_installed/{self.value('VCPKG_TARGET_TRIPLET')}",
+            "OPENSSL_USE_STATIC_LIBS": "true",
+            "DUCKDB_VERSION": self.value("DUCKDB_VERSION"),
+            "DUCKDB_COMMIT": self.value("DUCKDB_COMMIT"),
+            "DUCKDB_PLATFORM": self.architecture,
+            "DUCKDB_GIT_VERSION": self.duckdb_ref(),
+            "ENABLE_EXTENSION_AUTOINSTALL": "1",
+            "ENABLE_EXTENSION_AUTOLOADING": "1",
+            "EXTENSION_NAME": self.required("CI_EXTENSION_NAME"),
+            "EXTENSION_CANONICAL": self.value("CI_EXTENSION_CANONICAL"),
+            "LINUX_CI_IN_DOCKER": "1",
+            "GITHUB_ACTIONS": "true",
+            "CI": "true",
+            "CCACHE_MAXSIZE": "5G",
+            "SUBSET_EXTENSIONS_TESTS": self.value("CI_EXTENSIONS_TEST_SELECTION"),
+            "DUCKDB_PREBUILT_EXTENSIONS": self.value("DUCKDB_PREBUILT_EXTENSIONS"),
+        }
+        values.update(test_environment(self.value("CI_TEST_CONFIG", "{}")))
+        prebuilt_library = self.value("DUCKDB_PREBUILT_LIBRARY")
+        if prebuilt_library:
+            relative_library = Path(prebuilt_library).resolve().relative_to(
+                self.workspace
+            )
+            values["DUCKDB_PREBUILT_LIBRARY"] = f"/duckdb_build_dir/{relative_library.as_posix()}"
+        with (self.workspace / "docker_env.txt").open("w", encoding="utf-8") as handle:
+            for key, value in values.items():
+                value = value.rstrip("\r\n")
+                if "\n" in value or "\r" in value:
+                    raise ValueError(f"Docker environment value {key} contains a newline")
+                handle.write(f"{key}={value}\n")
+
+    def build_linux(self) -> None:
+        if self.enabled("CI_LINUX_NATIVE_CONTAINER"):
+            self.run_with_retry(
+                ["make", self.required("CI_BUILD_TYPE")],
+                extra_env=self.build_environment(),
+            )
+            return
+        self.run(
+            [
+                "docker",
+                "build",
+                "--build-arg",
+                f"vcpkg_url={self.required('CI_VCPKG_URL')}",
+                "--build-arg",
+                f"vcpkg_commit={self.required('CI_VCPKG_COMMIT')}",
+                "--build-arg",
+                f"extra_toolchains=;{self.value('CI_EXTRA_TOOLCHAINS').strip(';')};",
+                "--build-arg",
+                f"cuda_version={self.value('CI_CUDA_VERSION')}",
+                "-t",
+                f"duckdb/{self.architecture}",
+                str(self.workspace / "extension-ci-tools" / "docker" / self.architecture),
+            ]
+        )
+        self.create_docker_environment()
+        self.install_extra_vcpkg_dependencies(docker=True)
+        docker = self.docker_arguments()
+        self.run_with_retry([*docker, "make", "configure_ci"])
+        self.run_with_retry([*docker, "make", self.required("CI_BUILD_TYPE")])
+        post_build = self.value("CI_POST_BUILD_COMMAND")
+        if post_build:
+            self.run(post_build, shell=True, extra_env={"MATRIX_RUNNER": self.value("CI_MATRIX_RUNNER")})
+
+    def build_macos(self) -> None:
+        self.run(["make", self.required("CI_BUILD_TYPE")], extra_env=self.build_environment())
+
+    def build_windows(self) -> None:
+        environment = self.build_environment()
+        extension_flags = [
+            "-DCMAKE_C_COMPILER_LAUNCHER=ccache "
+            "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+        ]
+        if (
+            self.architecture == "windows_arm64"
+            and self.value("CC", "cl") == "clang-cl"
+        ):
+            extension_flags.extend(
+                [
+                    "-DCMAKE_C_COMPILER_TARGET=arm64-pc-windows-msvc",
+                    "-DCMAKE_CXX_COMPILER_TARGET=arm64-pc-windows-msvc",
+                ]
+            )
+        # Static triplets have no vcpkg DLLs to deploy.
+        if "static" in self.value("VCPKG_TARGET_TRIPLET").split("-"):
+            extension_flags.append("-DVCPKG_APPLOCAL_DEPS=OFF")
+        environment["EXT_FLAGS"] = " ".join(extension_flags)
+        rtools = environment["DUCKDB_PLATFORM_RTOOLS"] == "1"
+        commands = ["setlocal EnableDelayedExpansion"]
+        if not rtools:
+            target = {"windows_amd64": "vcvars64.bat", "windows_arm64": "vcvarsarm64.bat"}.get(self.architecture)
+            if target:
+                vs18_vcvars = (
+                    "C:\\Program Files\\Microsoft Visual Studio\\18\\Enterprise"
+                    f"\\VC\\Auxiliary\\Build\\{target}"
+                )
+                vs2022_vcvars = (
+                    "C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise"
+                    f"\\VC\\Auxiliary\\Build\\{target}"
+                )
+                vcvars = vs18_vcvars if os.path.isfile(vs18_vcvars) else vs2022_vcvars
+                # vcvars changes this cmd.exe process's environment, so the build
+                # must remain in the same shell invocation.
+                commands.append(f'call "{vcvars}"')
+            # Keep this optional rename separate from the &&-chained build command.
+            # Otherwise cmd.exe treats the build as part of the IF body and skips it
+            # when Git's link.exe is not present.
+            self.run(
+                'if exist "C:\\Program Files\\Git\\usr\\bin\\link.exe" '
+                'move "C:\\Program Files\\Git\\usr\\bin\\link.exe" '
+                '"C:\\Program Files\\Git\\usr\\bin\\link-git.exe"',
+                shell=True,
+                extra_env=environment,
+            )
+        build_command = format_windows_command(
+            [*self.retry_prefix(), "make", self.required("CI_BUILD_TYPE")]
+        )
+        commands.append(build_command)
+        self.run(" && ".join(commands), shell=True, extra_env=environment)
+
+    def build_wasm(self) -> None:
+        self.run_with_retry(["make", self.architecture], extra_env=self.build_environment())
+
+    def build(self) -> None:
+        prebuilt_source = self.value("CI_PREBUILT_DUCKDB_SOURCE")
+        if prebuilt_source == "staged":
+            if self.prebuilt():
+                self.prepare_prebuilt_duckdb()
+        elif prebuilt_source != "disabled":
+            # An empty source preserves compatibility with workflows that only
+            # configure CI_PREBUILT_DUCKDB_ARTIFACT.
+            self.prepare_prebuilt_duckdb()
+        getattr(self, f"build_{self.platform}")()
+
+    def _run_tests(self) -> None:
+        environment = self.build_environment()
+        environment["SUBSET_EXTENSIONS_TESTS"] = self.value("CI_EXTENSIONS_TEST_SELECTION")
+        environment.update(test_environment(self.value("CI_TEST_CONFIG", "{}")))
+        target = f"test_{self.required('CI_BUILD_TYPE')}"
+
+        if self.platform == "linux":
+            if self.enabled("CI_LINUX_NATIVE_CONTAINER"):
+                self.run(["make", target], extra_env=environment)
+            else:
+                self.run([*self.docker_arguments(), "make", target])
+                environment["LINUX_CI_IN_DOCKER"] = "0"
+                self.run(["make", target], extra_env=environment)
+        elif self.platform == "macos":
+            self.run(["make", target], extra_env=environment)
+        elif self.platform == "windows":
+            self.run(["make", target], extra_env=environment)
+
+    def test(self) -> None:
+        if self.enabled("CI_SKIP_TESTS"):
+            print("Tests skipped by workflow input.")
+            return
+        if self.platform == "linux" and self.architecture == "linux_arm64":
+            print("Tests are not supported for linux_arm64.")
+            return
+        if self.platform == "macos" and self.value("CI_OSX_BUILD_ARCH") != "arm64":
+            print("Tests run only on the native macOS arm64 build.")
+            return
+        if self.platform == "wasm":
+            print("The Wasm distribution job has no test target.")
+            return
+
+        repository = self.value("CI_EXTENSION_ARTIFACT_DIR")
+        if repository:
+            self._test_artifacts(Path(repository))
+            return
+        self._run_tests()
+
+    def artifact_path(self) -> str:
+        all_extensions = self.enabled("CI_UPLOAD_ALL_EXTENSIONS")
+        extension = self.required("CI_EXTENSION_NAME")
+        if self.platform == "wasm":
+            base = f"build/{self.architecture}"
+            return (
+                f"{base}/repository/**/*.duckdb_extension.wasm"
+                if all_extensions
+                else f"{base}/extension/{extension}/{extension}.duckdb_extension.wasm"
+            )
+        base = f"build/{self.required('CI_BUILD_TYPE')}"
+        return (
+            f"{base}/repository/**/*.duckdb_extension"
+            if all_extensions
+            else f"{base}/extension/{extension}/{extension}.duckdb_extension"
+        )
+
+    def print_rust_logs(self) -> None:
+        if not self.enabled("CI_RUST_LOGS") or not self.enabled("CI_HAS_RUST"):
+            return
+        pattern = self.workspace / "build" / self.required("CI_BUILD_TYPE") / "rust" / "src" / "**" / "*build-*.log"
+        logs = sorted(glob.glob(str(pattern), recursive=True))
+        if not logs:
+            print(f"No Rust build logs found under {pattern.parent}")
+            return
+        for filename in logs:
+            print(f"Printing logs for file {filename}")
+            print(Path(filename).read_text(encoding="utf-8", errors="replace"))
+            print(f"Done printing logs for file {filename}")
+
+    def upload(self) -> None:
+        path = self.artifact_path()
+        matches = sorted(
+            Path(match)
+            for match in glob.glob(str(self.workspace / path), recursive=True)
+        )
+        if not matches:
+            raise FileNotFoundError(f"no artifact matched {path}")
+        name = self.value("CI_ARTIFACT_NAME") or (
+            f"{self.required('CI_EXTENSION_NAME')}-{self.required('DUCKDB_VERSION')}-extension-"
+            f"{self.architecture}{self.value('CI_ARTIFACT_POSTFIX')}"
+        )
+        artifact_id = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+        staging = self.workspace / "ci-artifacts" / artifact_id
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True)
+
+        build_base = self.workspace / "build" / (
+            self.architecture if self.platform == "wasm" else self.required("CI_BUILD_TYPE")
+        )
+        source_root = (
+            build_base / "repository"
+            if self.enabled("CI_UPLOAD_ALL_EXTENSIONS")
+            else build_base / "extension" / self.required("CI_EXTENSION_NAME")
+        )
+        for source in matches:
+            destination = staging / source.relative_to(source_root)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+
+        if self._test_support_enabled():
+            archive = staging / "test-support" / artifact_id / "test-support.tar.gz"
+            self._bundle_test_support(archive)
+
+        self.append_github_file("GITHUB_OUTPUT", "artifact_path", str(staging))
+        self.append_github_file("GITHUB_OUTPUT", "artifact_name", name)
+        self.print_rust_logs()
+
+    def _test_support_enabled(self) -> bool:
+        if self.enabled("CI_SKIP_TESTS") or self.platform == "wasm":
+            return False
+        if self.platform == "linux":
+            return self.architecture != "linux_arm64"
+        if self.platform == "macos":
+            return self.value("CI_OSX_BUILD_ARCH") == "arm64"
+        return self.platform == "windows"
+
+    def _bundle_test_support(self, archive: Path) -> None:
+        build_type = self.required("CI_BUILD_TYPE")
+        build_dir = self.workspace / "build" / build_type
+        if not build_dir.is_dir():
+            raise FileNotFoundError(f"build directory does not exist: {build_dir}")
+
+        artifact_root = self.workspace / ".ci" / "test-support" / build_type
+        if artifact_root.exists():
+            shutil.rmtree(artifact_root)
+        artifact_root.mkdir(parents=True)
+
+        candidates = [
+            build_dir / "duckdb",
+            build_dir / "duckdb.exe",
+            build_dir / "test" / "run",
+            build_dir / "test" / "run.exe",
+            build_dir / "test" / "unittest",
+            build_dir / "test" / "unittest.exe",
+        ]
+        for source in candidates:
+            if source.is_file():
+                destination = artifact_root / source.relative_to(build_dir)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+
+        for pattern in (
+            "src/libduckdb.*",
+            "test/extension/*.duckdb_extension",
+            "test/extension/*.duckdb_extension.wasm",
+        ):
+            for source in build_dir.glob(pattern):
+                destination = artifact_root / source.relative_to(build_dir)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive, "w:gz", compresslevel=4) as bundle:
+            bundle.add(artifact_root, arcname=build_type)
+
+    def _test_artifacts(self, repository_root: Path) -> None:
+        archives = sorted((repository_root / "test-support").glob("**/test-support.tar.gz"))
+        if not archives:
+            raise FileNotFoundError(f"no test-support archives found below {repository_root}")
+
+        build_type = self.required("CI_BUILD_TYPE")
+        build_root = self.workspace / "build"
+        build_dir = build_root / build_type
+        for archive in archives:
+            if build_dir.exists():
+                shutil.rmtree(build_dir)
+            with tarfile.open(archive, "r:gz") as bundle:
+                members = bundle.getmembers()
+                for member in members:
+                    destination = (build_root / member.name).resolve()
+                    if build_root.resolve() not in destination.parents and destination != build_root.resolve():
+                        raise ValueError(f"unsafe path in test-support archive: {member.name}")
+                bundle.extractall(build_root)
+            destination_repository = build_dir / "repository"
+            destination_repository.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(
+                repository_root,
+                destination_repository,
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns("test-support"),
+            )
+            print(f"Testing support bundle from {archive}")
+            self._run_tests()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "phase",
+        choices=(
+            "checkout",
+            "setup",
+            "build",
+            "test",
+            "upload",
+        ),
+    )
+    args = parser.parse_args()
+    runner = PhaseRunner()
+    try:
+        getattr(runner, args.phase)()
+    except subprocess.CalledProcessError as error:
+        print(
+            f"error: command failed with exit code {error.returncode}: "
+            f"{format_command(error.cmd)}",
+            file=sys.stderr,
+        )
+        raise SystemExit(error.returncode) from None
+
+
+if __name__ == "__main__":
+    main()

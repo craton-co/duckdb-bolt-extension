@@ -1,0 +1,89 @@
+# name: test/sql/bolt_prepared.test
+# description: Prepared statements over Bolt tables read the data present at EXECUTE time
+# group: [bolt]
+#
+# Covers the paths that read the Bolt catalog in init (deferred bolt_query, bolt_scan, the
+# replacement scan). The eager bolt_query path and COPY ... FROM still return bind-time data
+# (docs/issues/W3-E-001); add those cases here when that is fixed.
+
+require bolt
+
+statement ok
+PRAGMA bolt_clear_tables;
+
+statement ok
+COPY (SELECT 1::INTEGER AS id, 10::INTEGER AS v) TO 'gpu_prep' (FORMAT bolt, USE_TMP_FILE FALSE);
+
+statement ok
+PREPARE prep_query AS SELECT count(*) FROM bolt_query('SELECT id, v FROM gpu_prep');
+
+statement ok
+PREPARE prep_scan AS SELECT count(*), max(id) FROM bolt_scan('gpu_prep') WHERE v >= 10;
+
+statement ok
+PREPARE prep_bare AS SELECT count(*) FROM gpu_prep;
+
+query I
+EXECUTE prep_query;
+----
+1
+
+query II
+EXECUTE prep_scan;
+----
+1	1
+
+query I
+EXECUTE prep_bare;
+----
+1
+
+# Replace the table with the same schema: every statement sees the new rows.
+statement ok
+COPY (SELECT range::INTEGER AS id, 10::INTEGER AS v FROM range(3)) TO 'gpu_prep' (FORMAT bolt, USE_TMP_FILE FALSE);
+
+query I
+EXECUTE prep_query;
+----
+3
+
+query II
+EXECUTE prep_scan;
+----
+3	2
+
+query I
+EXECUTE prep_bare;
+----
+3
+
+# Append: one row that passes the filter and one that does not.
+statement ok
+COPY (SELECT * FROM (VALUES (7, 70), (8, 5)) t(id, v)) TO 'gpu_prep' (FORMAT bolt, MODE 'append', USE_TMP_FILE FALSE);
+
+query I
+EXECUTE prep_query;
+----
+5
+
+query II
+EXECUTE prep_scan;
+----
+4	7
+
+query I
+EXECUTE prep_bare;
+----
+5
+
+statement ok
+DEALLOCATE prep_query;
+
+statement ok
+DEALLOCATE prep_scan;
+
+statement ok
+DEALLOCATE prep_bare;
+
+statement ok
+PRAGMA bolt_clear_tables;
