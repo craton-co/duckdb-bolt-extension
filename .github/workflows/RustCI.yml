@@ -123,7 +123,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@1.120
       - uses: Swatinem/rust-cache@v2
       # Build and run the tests too, so a test that uses a post-MSRV API fails here (W2-E-016).
       - run: cargo test --locked -p duckdb-bolt-core --features cuda-stub
