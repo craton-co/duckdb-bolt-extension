@@ -1,0 +1,141 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Rust checks for duckdb-bolt-core. Runs on hosts without CUDA via the `cuda-stub` feature;
+# GPU execution paths are not exercised here (the tests assert the host-planner-fallback backend).
+name: Rust CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  check:
+    # Linux, Windows (MSVC, +crt-static from .cargo/config.toml) and macOS: platform-specific code
+    # (sandbox path canonicalization, unaligned 128-bit access, dylib naming) is compiled and
+    # tested on every OS the distribution pipeline ships (W2-E-016).
+    name: clippy, test (cuda-stub, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    steps:
+      # No submodules: extension-ci-tools is only used by the Makefile / packaging, not by cargo.
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # `--workspace` is not usable: duckdb-neo's `build-extension` (native, wasm) and
+      # `build-extension-static` (core dev-dependency) features are mutually exclusive.
+      - name: clippy (core, tests)
+        run: cargo clippy --locked -p duckdb-bolt-core --features cuda-stub --all-targets -- -D warnings
+      - name: clippy (extension)
+        run: cargo clippy --locked -p duckdb-bolt-extension --features cuda-stub -- -D warnings
+      - name: test
+        run: cargo test --locked -p duckdb-bolt-core --features cuda-stub
+      - name: package file list (duckdb-bolt-core)
+        if: runner.os == 'Linux'
+        run: cargo package --locked -p duckdb-bolt-core --list
+
+  wasm:
+    # Compile-only: the wasm crate is excluded from the distribution matrix (no wasm build has been
+    # loaded in DuckDB-Wasm yet; see MainDistributionPipeline.yml), so this is
+    # the only job that notices when it stops building (W1-E-002 class problems, W2-E-016).
+    name: wasm crate (cargo check, clippy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # Same action and emsdk version as extension-ci-tools' wasm distribution job, so C code that
+      # dependency build scripts compile sees the same toolchain.
+      - uses: emscripten-core/setup-emsdk@4528d102f7230f0e7b276855c01ea1159be0e984 # v16
+        with:
+          version: 6.0.9
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-emscripten
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        run: cargo check --locked -p duckdb-bolt-wasm --target wasm32-unknown-emscripten
+      - name: clippy
+        run: cargo clippy --locked -p duckdb-bolt-wasm --target wasm32-unknown-emscripten -- -D warnings
+
+  sqllogictest:
+    # Builds the loadable extension with the extension-ci-tools Makefile and runs test/sql/*.test
+    # through DuckDB's SQLLogicTest runner (duckdb-sqllogictest-python, the runner `make test` uses
+    # in the distribution pipeline). The distribution pipeline skips tests on linux_amd64,
+    # linux_arm64 and osx_amd64, so without this job the full runner (loop, foreach, <REGEX>:, ...)
+    # only ran on macOS arm64 and Windows release builds. The Rust SLT runner in cargo test is a
+    # subset.
+    name: SQLLogicTest (DuckDB runner, debug build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # The extension is built with USE_UNSTABLE_C_API=1 and loads only in exactly
+      # TARGET_DUCKDB_VERSION (Makefile); the runner must use the same DuckDB release (upgrade.sh
+      # rewrites both).
+      DUCKDB_TEST_VERSION: "2.0.0"
+      BOLT_CUDA_STUB: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: configure
+        run: make configure
+      - name: build (debug)
+        run: make debug
+      - name: test (debug)
+        run: make test_debug
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      # Build and run the tests too, so a test that uses a post-MSRV API fails here (W2-E-016).
+      - run: cargo test --locked -p duckdb-bolt-core --features cuda-stub
+      - run: cargo check --locked -p duckdb-bolt-extension --features cuda-stub
+
+  deny:
+    name: cargo deny (licenses, advisories, bans, sources)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features

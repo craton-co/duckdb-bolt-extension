@@ -1,0 +1,238 @@
+# name: test/sql/bolt.test
+# description: End-to-end SQLLogicTest suite for the Craton Bolt DuckDB extension
+# group: [bolt]
+
+require bolt
+
+# 1. Verify extension version and configuration options
+query I
+SELECT bolt_version() LIKE 'duckdb-bolt-extension v%';
+----
+true
+
+query I
+SELECT current_setting('bolt_device')::INTEGER;
+----
+0
+
+query I
+SELECT current_setting('bolt_memory_budget')::BIGINT;
+----
+0
+
+statement ok
+SET bolt_memory_budget = 536870912;
+
+query I
+SELECT current_setting('bolt_memory_budget')::BIGINT;
+----
+536870912
+
+statement ok
+RESET bolt_memory_budget;
+
+# 2. Clear any prior tables and verify empty catalog
+statement ok
+PRAGMA bolt_clear_tables;
+
+query I
+SELECT count(*) FROM bolt_tables();
+----
+0
+
+# 3. Upload a DuckDB table to Craton Bolt GPU memory via COPY ... TO (FORMAT bolt)
+statement ok
+CREATE TABLE sales (
+    id INTEGER,
+    region VARCHAR,
+    amount DOUBLE,
+    active BOOLEAN
+);
+
+statement ok
+INSERT INTO sales VALUES
+    (1, 'north', 100.5, true),
+    (2, 'south', 200.0, true),
+    (3, 'north', 150.25, false),
+    (4, 'east', 300.75, true),
+    (5, 'south', 50.0, true);
+
+statement ok
+COPY sales TO 'gpu_sales' (FORMAT bolt, USE_TMP_FILE FALSE);
+
+query TIII
+SELECT table_name, num_rows, num_columns, bytes_in_memory > 0 FROM bolt_tables();
+----
+gpu_sales	5	4	true
+
+# 4. Execute GPU SQL queries via bolt_query and bolt_sql
+query TR
+SELECT region, total FROM bolt_query('SELECT region, SUM(amount) AS total FROM gpu_sales GROUP BY region ORDER BY region');
+----
+east	300.75
+north	250.75
+south	250.0
+
+query I
+SELECT count(*) FROM bolt_sql('SELECT id, amount FROM gpu_sales WHERE amount > 120.0');
+----
+3
+
+# 5. Scan GPU table via bolt_scan and replacement scan (with projection & filter pushdown)
+query IT
+SELECT id, region FROM bolt_scan('gpu_sales') WHERE amount >= 200.0 ORDER BY id;
+----
+2	south
+4	east
+
+query IT
+SELECT id, region FROM bolt.gpu_sales WHERE region = 'north' ORDER BY id;
+----
+1	north
+3	north
+
+# 6. Append additional rows via COPY ... TO (FORMAT bolt, MODE 'append')
+statement ok
+COPY (SELECT 6 AS id, 'west' AS region, 400.0 AS amount, true AS active) TO 'gpu_sales' (FORMAT bolt, MODE 'append', USE_TMP_FILE FALSE);
+
+query I
+SELECT num_rows FROM bolt_tables() WHERE table_name = 'gpu_sales';
+----
+6
+
+# 7. Copy back from Bolt GPU table into a DuckDB table via COPY ... FROM (FORMAT bolt)
+statement ok
+CREATE TABLE sales_roundtrip (
+    id INTEGER,
+    region VARCHAR,
+    amount DOUBLE,
+    active BOOLEAN
+);
+
+statement ok
+COPY sales_roundtrip FROM 'gpu_sales' (FORMAT bolt);
+
+query I
+SELECT count(*) FROM sales_roundtrip;
+----
+6
+
+# 8. Test bolt_explain, bolt_execution_tier, bolt_pool_stats, bolt_metrics, and bolt_drop_table
+query I
+SELECT length(bolt_explain('SELECT region, SUM(amount) FROM gpu_sales GROUP BY region')) > 0;
+----
+true
+
+query I
+SELECT bolt_execution_tier('SELECT id, amount FROM gpu_sales WHERE amount > 100.0') IN ('Gpu', 'Host', 'Hybrid');
+----
+true
+
+query I
+SELECT count(*) FROM bolt_pool_stats();
+----
+1
+
+query I
+SELECT count(*) > 0 FROM bolt_metrics();
+----
+true
+
+query I
+SELECT bolt_drop_table('gpu_sales');
+----
+true
+
+query I
+SELECT bolt_drop_table('gpu_sales');
+----
+false
+
+# 9. Regression tests: Nullable three-valued logic filter pushdown, HUGEINT, DECIMAL(38,6), DATE, TIMESTAMP
+statement ok
+COPY (
+    SELECT
+        1::INTEGER AS id,
+        1234567890123456789::HUGEINT AS big_val,
+        999999.123456::DECIMAL(38, 6) AS dec_val,
+        DATE '2026-03-01' AS dt,
+        true AS flag
+    UNION ALL
+    SELECT
+        2::INTEGER AS id,
+        NULL::HUGEINT AS big_val,
+        NULL::DECIMAL(38, 6) AS dec_val,
+        NULL::DATE AS dt,
+        NULL::BOOLEAN AS flag
+) TO 'bolt://gpu_rich_regression.bolt' (FORMAT bolt, MODE 'replace', USE_TMP_FILE FALSE);
+
+query I
+SELECT count(*) FROM bolt.gpu_rich_regression WHERE flag = true;
+----
+1
+
+query I
+SELECT count(*) FROM bolt.gpu_rich_regression WHERE flag = false;
+----
+0
+
+query I
+SELECT count(*) FROM bolt.gpu_rich_regression WHERE flag IS NULL;
+----
+1
+
+query I
+SELECT count(*) FROM 'bolt:gpu_rich_regression' WHERE id = 1;
+----
+1
+
+query TT
+SELECT big_val::VARCHAR, dec_val::VARCHAR FROM bolt.main.gpu_rich_regression WHERE id = 1;
+----
+1234567890123456789	999999.123456
+
+# 10. Test bolt_register_sql, bolt_devices, bolt_prometheus_metrics, PRAGMA bolt_info, PRAGMA bolt_reset
+query I
+SELECT bolt_register_sql('gpu_sub', 'SELECT id FROM gpu_rich_regression WHERE id = 1');
+----
+1
+
+query I
+SELECT id FROM bolt.gpu_sub;
+----
+1
+
+query I
+SELECT count(*) FROM bolt_devices() WHERE device_id < 0 OR name IS NULL OR total_memory_bytes < 0;
+----
+0
+
+query I
+SELECT length(bolt_metrics_prometheus()) > 0;
+----
+true
+
+statement ok
+PRAGMA bolt_info;
+
+statement ok
+PRAGMA bolt_reset;
+
+# 11. Error handling checks
+statement error
+SELECT * FROM bolt_scan('non_existent_gpu_table');
+----
+is not registered in Craton Bolt
+
+statement error
+COPY (SELECT 1 AS a) TO 'bad_mode' (FORMAT bolt, MODE 'invalid_mode', USE_TMP_FILE FALSE);
+----
+Invalid Bolt registration mode 'invalid_mode'
+
+statement ok
+SELECT bolt_clear_tables();
+
+query I
+SELECT count(*) FROM bolt_tables();
+----
+0

@@ -1,0 +1,319 @@
+# name: test/sql/bolt_pushdown.test
+# description: Differential filter-pushdown tests: bolt_scan results must equal plain DuckDB for every predicate
+# group: [bolt]
+#
+# Each query returns the size of the symmetric difference between the rows DuckDB selects from
+# the local table and the rows bolt_scan selects from the uploaded copy; it must be 0. On the
+# cuda-gpu backend the predicates are pushed into Craton Bolt; on host-planner-fallback DuckDB
+# evaluates them, so the file passes trivially there but still checks the scan itself.
+# Projecting the VARCHAR column `name` exercises the GPU filter + host gather path
+# (execute_gpu_filter_take); projecting only numeric columns exercises the plain GPU path.
+#
+# Report 1.1.1 (fixed): only lossless widening CASTs are stripped; see "Explicit CASTs" below.
+# Report 1.1.3 (fixed): integer arithmetic is no longer pushed, so overflow raises "Out of Range"
+#   (see "Arithmetic" below).
+# Report 1.1.2 (fixed by RFC-008): TIMESTAMPTZ predicates in non-UTC session time zones are
+#   checked differentially in bolt_timestamptz.test.
+
+require bolt
+
+statement ok
+PRAGMA bolt_clear_tables;
+
+statement ok
+CREATE TABLE pd_local AS
+SELECT
+    i::INTEGER AS id,
+    CASE WHEN i % 13 = 0 THEN NULL ELSE (i % 7)::INTEGER END AS a,
+    (i % 5)::BIGINT AS b,
+    CASE WHEN i % 17 = 0 THEN NULL ELSE i * 0.25 END::DOUBLE AS d,
+    (i % 9 - 4)::FLOAT AS f,
+    CASE WHEN i % 11 = 0 THEN NULL
+         WHEN i % 3 = 0 THEN 'north_' || i::VARCHAR
+         WHEN i % 3 = 1 THEN 'south_' || i::VARCHAR
+         ELSE 'east' END AS name,
+    CASE WHEN i % 19 = 0 THEN NULL ELSE i % 2 = 0 END AS flag,
+    DATE '2024-01-01' + (i % 60)::INTEGER AS dt,
+    CASE WHEN i % 23 = 0 THEN NULL
+         ELSE TIMESTAMP '2024-01-01 00:00:00' + INTERVAL (i * 5) HOUR END AS ts,
+    (i * 1.25)::DECIMAL(9, 2) AS dec,
+    (i % 100)::SMALLINT AS small,
+    (i * 1000)::UINTEGER AS u
+FROM range(1, 401) t(i);
+
+statement ok
+COPY pd_local TO 'gpu_pd' (FORMAT bolt, USE_TMP_FILE FALSE);
+
+# Sanity: the full scan is identical.
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM pd_local EXCEPT ALL SELECT * FROM bolt_scan('gpu_pd'))
+    UNION ALL
+    (SELECT * FROM bolt_scan('gpu_pd') EXCEPT ALL SELECT * FROM pd_local)
+);
+----
+0
+
+# --- Comparisons on every column type (numeric projection) ---
+
+query I
+SELECT count(*) FROM ((SELECT id, a FROM pd_local WHERE a = 3 EXCEPT ALL SELECT id, a FROM bolt_scan('gpu_pd') WHERE a = 3) UNION ALL (SELECT id, a FROM bolt_scan('gpu_pd') WHERE a = 3 EXCEPT ALL SELECT id, a FROM pd_local WHERE a = 3));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE a != 3 EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE a != 3) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE a != 3 EXCEPT ALL SELECT id FROM pd_local WHERE a != 3));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE b >= 3 EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE b >= 3) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE b >= 3 EXCEPT ALL SELECT id FROM pd_local WHERE b >= 3));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE d < 20.5 EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE d < 20.5) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE d < 20.5 EXCEPT ALL SELECT id FROM pd_local WHERE d < 20.5));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE f > 1.5::FLOAT EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE f > 1.5::FLOAT) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE f > 1.5::FLOAT EXCEPT ALL SELECT id FROM pd_local WHERE f > 1.5::FLOAT));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE dt <= DATE '2024-01-15' EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE dt <= DATE '2024-01-15') UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE dt <= DATE '2024-01-15' EXCEPT ALL SELECT id FROM pd_local WHERE dt <= DATE '2024-01-15'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE ts > TIMESTAMP '2024-02-01 12:00:00' EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE ts > TIMESTAMP '2024-02-01 12:00:00') UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE ts > TIMESTAMP '2024-02-01 12:00:00' EXCEPT ALL SELECT id FROM pd_local WHERE ts > TIMESTAMP '2024-02-01 12:00:00'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE dec >= 100.00::DECIMAL(9, 2) EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE dec >= 100.00::DECIMAL(9, 2)) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE dec >= 100.00::DECIMAL(9, 2) EXCEPT ALL SELECT id FROM pd_local WHERE dec >= 100.00::DECIMAL(9, 2)));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE small < 10 EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE small < 10) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE small < 10 EXCEPT ALL SELECT id FROM pd_local WHERE small < 10));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE u BETWEEN 50000 AND 150000 EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE u BETWEEN 50000 AND 150000) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE u BETWEEN 50000 AND 150000 EXCEPT ALL SELECT id FROM pd_local WHERE u BETWEEN 50000 AND 150000));
+----
+0
+
+# --- Boolean column, NULL tests, IN lists, NOT, OR (three-valued logic) ---
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE flag EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE flag) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE flag EXCEPT ALL SELECT id FROM pd_local WHERE flag));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE NOT flag EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE NOT flag) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE NOT flag EXCEPT ALL SELECT id FROM pd_local WHERE NOT flag));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE a IS NULL EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE a IS NULL) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE a IS NULL EXCEPT ALL SELECT id FROM pd_local WHERE a IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE ts IS NOT NULL AND d IS NULL EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE ts IS NOT NULL AND d IS NULL) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE ts IS NOT NULL AND d IS NULL EXCEPT ALL SELECT id FROM pd_local WHERE ts IS NOT NULL AND d IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE a IN (1, 4, 6) EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE a IN (1, 4, 6)) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE a IN (1, 4, 6) EXCEPT ALL SELECT id FROM pd_local WHERE a IN (1, 4, 6)));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE a NOT IN (1, 4, 6) EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE a NOT IN (1, 4, 6)) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE a NOT IN (1, 4, 6) EXCEPT ALL SELECT id FROM pd_local WHERE a NOT IN (1, 4, 6)));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE NOT (a = 2) EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE NOT (a = 2)) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE NOT (a = 2) EXCEPT ALL SELECT id FROM pd_local WHERE NOT (a = 2)));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE NOT (a = 2 AND d > 10) EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE NOT (a = 2 AND d > 10)) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE NOT (a = 2 AND d > 10) EXCEPT ALL SELECT id FROM pd_local WHERE NOT (a = 2 AND d > 10)));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE a = 1 OR d IS NULL EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE a = 1 OR d IS NULL) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE a = 1 OR d IS NULL EXCEPT ALL SELECT id FROM pd_local WHERE a = 1 OR d IS NULL));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE (a = 1 OR b = 2) AND (flag OR d < 30) EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE (a = 1 OR b = 2) AND (flag OR d < 30)) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE (a = 1 OR b = 2) AND (flag OR d < 30) EXCEPT ALL SELECT id FROM pd_local WHERE (a = 1 OR b = 2) AND (flag OR d < 30)));
+----
+0
+
+# --- Arithmetic ---
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE a + b > 6 EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE a + b > 6) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE a + b > 6 EXCEPT ALL SELECT id FROM pd_local WHERE a + b > 6));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE a * 2 - b >= 5 EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE a * 2 - b >= 5) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE a * 2 - b >= 5 EXCEPT ALL SELECT id FROM pd_local WHERE a * 2 - b >= 5));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE d * 2 > 150.5 EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE d * 2 > 150.5) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE d * 2 > 150.5 EXCEPT ALL SELECT id FROM pd_local WHERE d * 2 > 150.5));
+----
+0
+
+# Integer overflow in a filter is an error, as in DuckDB (UINTEGER * UINTEGER overflows from
+# u = 66000 on). Before the fix the GPU wrapped silently and returned rows.
+statement error
+SELECT count(*) FROM bolt_scan('gpu_pd') WHERE u * u > 0;
+----
+Overflow in multiplication
+
+statement error
+SELECT count(*) FROM bolt_scan('gpu_pd') WHERE id * id * id * id * 1000 > 0;
+----
+Overflow in multiplication
+
+# --- Explicit CASTs (report 1.1.1): narrowing / float-to-int casts must keep DuckDB semantics ---
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE CAST(d AS INTEGER) = 3 EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(d AS INTEGER) = 3) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(d AS INTEGER) = 3 EXCEPT ALL SELECT id FROM pd_local WHERE CAST(d AS INTEGER) = 3));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE CAST(d AS INTEGER) >= 50 EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(d AS INTEGER) >= 50) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(d AS INTEGER) >= 50 EXCEPT ALL SELECT id FROM pd_local WHERE CAST(d AS INTEGER) >= 50));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE CAST(d AS BIGINT) < 10 EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(d AS BIGINT) < 10) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(d AS BIGINT) < 10 EXCEPT ALL SELECT id FROM pd_local WHERE CAST(d AS BIGINT) < 10));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE CAST(f AS INTEGER) = 2 EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(f AS INTEGER) = 2) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(f AS INTEGER) = 2 EXCEPT ALL SELECT id FROM pd_local WHERE CAST(f AS INTEGER) = 2));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE CAST(d AS FLOAT) < 20.5 EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(d AS FLOAT) < 20.5) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(d AS FLOAT) < 20.5 EXCEPT ALL SELECT id FROM pd_local WHERE CAST(d AS FLOAT) < 20.5));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE CAST(a AS BIGINT) > 3 EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(a AS BIGINT) > 3) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(a AS BIGINT) > 3 EXCEPT ALL SELECT id FROM pd_local WHERE CAST(a AS BIGINT) > 3));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE CAST(small AS INTEGER) < 10 EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(small AS INTEGER) < 10) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(small AS INTEGER) < 10 EXCEPT ALL SELECT id FROM pd_local WHERE CAST(small AS INTEGER) < 10));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE CAST(small AS TINYINT) = 7 EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(small AS TINYINT) = 7) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(small AS TINYINT) = 7 EXCEPT ALL SELECT id FROM pd_local WHERE CAST(small AS TINYINT) = 7));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE CAST(u AS INTEGER) <= 150000 EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(u AS INTEGER) <= 150000) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(u AS INTEGER) <= 150000 EXCEPT ALL SELECT id FROM pd_local WHERE CAST(u AS INTEGER) <= 150000));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE CAST(a AS DOUBLE) > 2.5 EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(a AS DOUBLE) > 2.5) UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(a AS DOUBLE) > 2.5 EXCEPT ALL SELECT id FROM pd_local WHERE CAST(a AS DOUBLE) > 2.5));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE CAST(id AS VARCHAR) LIKE '1%' EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(id AS VARCHAR) LIKE '1%') UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(id AS VARCHAR) LIKE '1%' EXCEPT ALL SELECT id FROM pd_local WHERE CAST(id AS VARCHAR) LIKE '1%'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE CAST(ts AS DATE) = DATE '2024-01-10' EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(ts AS DATE) = DATE '2024-01-10') UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(ts AS DATE) = DATE '2024-01-10' EXCEPT ALL SELECT id FROM pd_local WHERE CAST(ts AS DATE) = DATE '2024-01-10'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id FROM pd_local WHERE CAST(dt AS TIMESTAMP) > TIMESTAMP '2024-02-01 00:00:00' EXCEPT ALL SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(dt AS TIMESTAMP) > TIMESTAMP '2024-02-01 00:00:00') UNION ALL (SELECT id FROM bolt_scan('gpu_pd') WHERE CAST(dt AS TIMESTAMP) > TIMESTAMP '2024-02-01 00:00:00' EXCEPT ALL SELECT id FROM pd_local WHERE CAST(dt AS TIMESTAMP) > TIMESTAMP '2024-02-01 00:00:00'));
+----
+0
+
+# --- String predicates, projecting the VARCHAR column (GPU filter + host gather) ---
+
+query I
+SELECT count(*) FROM ((SELECT id, name FROM pd_local WHERE name = 'east' EXCEPT ALL SELECT id, name FROM bolt_scan('gpu_pd') WHERE name = 'east') UNION ALL (SELECT id, name FROM bolt_scan('gpu_pd') WHERE name = 'east' EXCEPT ALL SELECT id, name FROM pd_local WHERE name = 'east'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id, name FROM pd_local WHERE name IN ('east', 'north_3', 'south_4') EXCEPT ALL SELECT id, name FROM bolt_scan('gpu_pd') WHERE name IN ('east', 'north_3', 'south_4')) UNION ALL (SELECT id, name FROM bolt_scan('gpu_pd') WHERE name IN ('east', 'north_3', 'south_4') EXCEPT ALL SELECT id, name FROM pd_local WHERE name IN ('east', 'north_3', 'south_4')));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id, name FROM pd_local WHERE name LIKE 'n_rth%' EXCEPT ALL SELECT id, name FROM bolt_scan('gpu_pd') WHERE name LIKE 'n_rth%') UNION ALL (SELECT id, name FROM bolt_scan('gpu_pd') WHERE name LIKE 'n_rth%' EXCEPT ALL SELECT id, name FROM pd_local WHERE name LIKE 'n_rth%'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id, name FROM pd_local WHERE name NOT LIKE 'south%' EXCEPT ALL SELECT id, name FROM bolt_scan('gpu_pd') WHERE name NOT LIKE 'south%') UNION ALL (SELECT id, name FROM bolt_scan('gpu_pd') WHERE name NOT LIKE 'south%' EXCEPT ALL SELECT id, name FROM pd_local WHERE name NOT LIKE 'south%'));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id, name FROM pd_local WHERE starts_with(name, 'so') AND id > 100 EXCEPT ALL SELECT id, name FROM bolt_scan('gpu_pd') WHERE starts_with(name, 'so') AND id > 100) UNION ALL (SELECT id, name FROM bolt_scan('gpu_pd') WHERE starts_with(name, 'so') AND id > 100 EXCEPT ALL SELECT id, name FROM pd_local WHERE starts_with(name, 'so') AND id > 100));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id, name FROM pd_local WHERE suffix(name, '7') OR contains(name, 'h_1') EXCEPT ALL SELECT id, name FROM bolt_scan('gpu_pd') WHERE suffix(name, '7') OR contains(name, 'h_1')) UNION ALL (SELECT id, name FROM bolt_scan('gpu_pd') WHERE suffix(name, '7') OR contains(name, 'h_1') EXCEPT ALL SELECT id, name FROM pd_local WHERE suffix(name, '7') OR contains(name, 'h_1')));
+----
+0
+
+# A pattern with a single quote and LIKE wildcards in the data.
+query I
+SELECT count(*) FROM ((SELECT id, name FROM pd_local WHERE name LIKE '%''%' EXCEPT ALL SELECT id, name FROM bolt_scan('gpu_pd') WHERE name LIKE '%''%') UNION ALL (SELECT id, name FROM bolt_scan('gpu_pd') WHERE name LIKE '%''%' EXCEPT ALL SELECT id, name FROM pd_local WHERE name LIKE '%''%'));
+----
+0
+
+# Unsupported expressions (a function call) are evaluated by DuckDB and still agree.
+query I
+SELECT count(*) FROM ((SELECT id, name FROM pd_local WHERE length(name) = 4 EXCEPT ALL SELECT id, name FROM bolt_scan('gpu_pd') WHERE length(name) = 4) UNION ALL (SELECT id, name FROM bolt_scan('gpu_pd') WHERE length(name) = 4 EXCEPT ALL SELECT id, name FROM pd_local WHERE length(name) = 4));
+----
+0
+
+# Predicates that match nothing, with and without a VARCHAR projection.
+query I
+SELECT count(*) FROM bolt_scan('gpu_pd') WHERE id > 100000;
+----
+0
+
+query I
+SELECT count(name) FROM bolt_scan('gpu_pd') WHERE id < 0;
+----
+0
+
+# The replacement scan inherits the same pushdown.
+query I
+SELECT count(*) FROM ((SELECT id, name FROM pd_local WHERE a = 5 AND name LIKE 'e%' EXCEPT ALL SELECT id, name FROM bolt.gpu_pd WHERE a = 5 AND name LIKE 'e%') UNION ALL (SELECT id, name FROM bolt.gpu_pd WHERE a = 5 AND name LIKE 'e%' EXCEPT ALL SELECT id, name FROM pd_local WHERE a = 5 AND name LIKE 'e%'));
+----
+0
+
+statement ok
+PRAGMA bolt_clear_tables;

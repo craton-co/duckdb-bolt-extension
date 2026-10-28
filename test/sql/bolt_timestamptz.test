@@ -1,0 +1,130 @@
+# name: test/sql/bolt_timestamptz.test
+# description: TIMESTAMPTZ round-trips and predicates through bolt_scan in a non-UTC session time zone
+# group: [bolt]
+#
+# Runs on both backends. RFC-008 (W2-C-001) stores TIMESTAMPTZ as naive UTC micros with the original
+# type in the field metadata, so bolt_scan declares TIMESTAMPTZ and every comparison below must
+# match plain DuckDB whatever the session TimeZone (tightened from W1-E-013, report 1.1.2). The table
+# has NULLs (pushed SQL runs on the host fallback) and a NULL-free copy (GPU engine on cuda-gpu).
+
+require bolt
+
+statement ok
+PRAGMA bolt_clear_tables;
+
+statement ok
+SET TimeZone = 'America/New_York';
+
+statement ok
+CREATE TABLE tz_src AS
+SELECT
+    i::INTEGER AS id,
+    CASE WHEN i % 7 = 0 THEN NULL
+         ELSE TIMESTAMPTZ '2024-03-10 00:00:00+00' + INTERVAL (i * 37) MINUTE END AS tstz,
+    TIMESTAMP '2024-03-10 00:00:00' + INTERVAL (i * 37) MINUTE AS ts
+FROM range(0, 300) t(i);
+
+statement ok
+CREATE TABLE tz_src_nn AS SELECT * FROM tz_src WHERE tstz IS NOT NULL;
+
+statement ok
+COPY tz_src TO 'gpu_tz' (FORMAT bolt, USE_TMP_FILE FALSE);
+
+statement ok
+COPY tz_src_nn TO 'gpu_tz_nn' (FORMAT bolt, USE_TMP_FILE FALSE);
+
+query T
+SELECT typeof(tstz) FROM bolt_scan('gpu_tz') LIMIT 1;
+----
+TIMESTAMP WITH TIME ZONE
+
+# Full scans are identical (values are instants, displayed in the session time zone).
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM tz_src EXCEPT ALL SELECT * FROM bolt_scan('gpu_tz'))
+    UNION ALL
+    (SELECT * FROM bolt_scan('gpu_tz') EXCEPT ALL SELECT * FROM tz_src)
+);
+----
+0
+
+query T
+SELECT tstz::VARCHAR FROM bolt_scan('gpu_tz') WHERE id = 1;
+----
+2024-03-09 19:37:00-05
+
+# Predicates with TIMESTAMPTZ constants (UTC and non-UTC offsets), TIMESTAMP constants (cast in
+# the session time zone) and casts to DATE / TIMESTAMP, which depend on the time zone.
+query I
+SELECT count(*) FROM (
+    (SELECT id FROM tz_src WHERE tstz > TIMESTAMPTZ '2024-03-10 06:00:00+00'
+     EXCEPT ALL SELECT id FROM bolt_scan('gpu_tz') WHERE tstz > TIMESTAMPTZ '2024-03-10 06:00:00+00')
+    UNION ALL
+    (SELECT id FROM bolt_scan('gpu_tz') WHERE tstz > TIMESTAMPTZ '2024-03-10 06:00:00+00'
+     EXCEPT ALL SELECT id FROM tz_src WHERE tstz > TIMESTAMPTZ '2024-03-10 06:00:00+00')
+);
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM tz_src WHERE tstz <= TIMESTAMPTZ '2024-03-10 08:00:00+05:30')
+     = (SELECT count(*) FROM bolt_scan('gpu_tz') WHERE tstz <= TIMESTAMPTZ '2024-03-10 08:00:00+05:30');
+----
+true
+
+query I
+SELECT (SELECT count(*) FROM tz_src WHERE tstz = TIMESTAMPTZ '2024-03-10 00:37:00+00')
+     = (SELECT count(*) FROM bolt_scan('gpu_tz') WHERE tstz = TIMESTAMPTZ '2024-03-10 00:37:00+00');
+----
+true
+
+query I
+SELECT (SELECT count(*) FROM tz_src WHERE tstz < TIMESTAMP '2024-03-10 03:00:00')
+     = (SELECT count(*) FROM bolt_scan('gpu_tz') WHERE tstz < TIMESTAMP '2024-03-10 03:00:00');
+----
+true
+
+query I
+SELECT (SELECT count(*) FROM tz_src WHERE CAST(tstz AS DATE) = DATE '2024-03-10')
+     = (SELECT count(*) FROM bolt_scan('gpu_tz') WHERE CAST(tstz AS DATE) = DATE '2024-03-10');
+----
+true
+
+query I
+SELECT (SELECT count(*) FROM tz_src WHERE CAST(tstz AS TIMESTAMP) >= ts)
+     = (SELECT count(*) FROM bolt_scan('gpu_tz') WHERE CAST(tstz AS TIMESTAMP) >= ts);
+----
+true
+
+query I
+SELECT (SELECT count(*) FROM tz_src_nn WHERE tstz BETWEEN TIMESTAMPTZ '2024-03-10 02:00:00+00' AND TIMESTAMPTZ '2024-03-10 09:00:00+00')
+     = (SELECT count(*) FROM bolt_scan('gpu_tz_nn') WHERE tstz BETWEEN TIMESTAMPTZ '2024-03-10 02:00:00+00' AND TIMESTAMPTZ '2024-03-10 09:00:00+00');
+----
+true
+
+query I
+SELECT (SELECT count(*) FROM tz_src_nn WHERE tstz IN (TIMESTAMPTZ '2024-03-10 00:37:00+00', TIMESTAMPTZ '2024-03-10 01:14:00+00'))
+     = (SELECT count(*) FROM bolt_scan('gpu_tz_nn') WHERE tstz IN (TIMESTAMPTZ '2024-03-10 00:37:00+00', TIMESTAMPTZ '2024-03-10 01:14:00+00'));
+----
+true
+
+# Another time zone: the stored instants do not move.
+statement ok
+SET TimeZone = 'Asia/Kolkata';
+
+query T
+SELECT tstz::VARCHAR FROM bolt_scan('gpu_tz') WHERE id = 1;
+----
+2024-03-10 06:07:00+05:30
+
+query I
+SELECT (SELECT count(*) FROM tz_src WHERE tstz < TIMESTAMP '2024-03-10 08:00:00')
+     = (SELECT count(*) FROM bolt_scan('gpu_tz') WHERE tstz < TIMESTAMP '2024-03-10 08:00:00');
+----
+true
+
+statement ok
+SET TimeZone = 'UTC';
+
+statement ok
+PRAGMA bolt_clear_tables;

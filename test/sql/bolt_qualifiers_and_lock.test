@@ -1,0 +1,63 @@
+# name: test/sql/bolt_qualifiers_and_lock.test
+# description: replacement-scan qualifiers (W6-B-001) and runtime pragmas under lock_configuration (W6-B-002)
+# group: [bolt]
+#
+# lock_configuration cannot be turned off again in a running database, so this file needs its own
+# database (both DuckDB's unittest and the Rust runner open a fresh one per file) and locks it last.
+
+require bolt
+
+statement ok
+PRAGMA bolt_clear_tables;
+
+statement ok
+COPY (SELECT range::INTEGER AS v FROM range(3)) TO 'qual_t' (FORMAT bolt, USE_TMP_FILE FALSE);
+
+# The documented forms scan the Bolt table.
+query I
+SELECT count(*) FROM qual_t;
+----
+3
+
+query I
+SELECT count(*) FROM bolt.qual_t;
+----
+3
+
+query I
+SELECT count(*) FROM bolt.main.qual_t;
+----
+3
+
+query I
+SELECT count(*) FROM 'bolt:qual_t';
+----
+3
+
+# Other qualifiers are left to DuckDB's catalog.
+statement error
+SELECT count(*) FROM bolt.other.qual_t;
+----
+Catalog Error
+
+statement error
+SELECT count(*) FROM memory.bolt.qual_t;
+----
+Catalog Error
+
+# Locked configuration: the runtime pragmas are refused, catalog pragmas still work.
+statement ok
+SET lock_configuration = true;
+
+statement error
+PRAGMA bolt_request_timeout(1);
+----
+lock_configuration = true
+
+statement error
+PRAGMA bolt_reset;
+----
+lock_configuration = true
+
+statement ok
+PRAGMA bolt_clear_tables;
