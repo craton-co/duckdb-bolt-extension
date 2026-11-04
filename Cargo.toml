@@ -34,7 +34,7 @@ arrow-ipc = { version = "53", features = ["lz4", "zstd"] }
 # W3-D-001: every codec DuckDB's `read_parquet` decodes. `zstd` compiles the zstd C library
 # with `cc` (no bindgen); `lz4` (lz4_flex), `brotli`, `snap` and `flate2` (rust_backend) are pure Rust.
 parquet = { version = "53", default-features = false, features = ["arrow", "snap", "flate2", "zstd", "lz4", "brotli"] }
-craton-bolt = "0.9.0"
+craton-bolt = "0.10.0"
 
 [profile.release]
 lto = "thin"

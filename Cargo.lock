@@ -436,9 +436,9 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "craton-bolt"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afb4c246d2d3975a655a15e4e3176e55f6dbe0a9e6b59f5d172e5237365202f2"
+checksum = "1a327910ae7a4435392aa9264181c843287af8b0838d885ecdad9de6c1b1ba53"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -451,6 +451,9 @@ dependencies = [
  "log",
  "once_cell",
  "parking_lot",
+ "parquet",
+ "serde",
+ "serde_json",
  "sqlparser",
  "thiserror",
  "tracing",
@@ -1420,6 +1423,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a875d8cd437cc8a97e9aeaeea352ec9a19aea99c23e9effb17757291de80b08"
 dependencies = [
  "log",
+ "sqlparser_derive",
+]
+
+[[package]]
+name = "sqlparser_derive"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01b2e185515564f15375f593fb966b5718bc624ba77fe49fa4616ad619690554"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
